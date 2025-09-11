@@ -1,0 +1,13 @@
+# Web scraping and automation
+crawl4ai
+playwright
+
+# LLM integration
+openai
+
+# Async file and HTTP operations
+aiofiles
+aiohttp
+
+# Environment configuration
+python-dotenv
