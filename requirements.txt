@@ -1,6 +1,7 @@
 # Web scraping and automation
 crawl4ai
 playwright
+cssselect
 
 # LLM integration
 openai
