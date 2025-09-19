@@ -68,3 +68,6 @@ Thumbs.db
 
 # Local environment variables
 *.env
+
+# md file output
+crawl_output/
