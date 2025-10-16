@@ -1,13 +1,14 @@
 import asyncio
+import html
 import os
 import re
+import shutil
+import traceback
 import urllib.parse
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, DefaultMarkdownGenerator
-from playwright.async_api import Page, BrowserContext
-import aiohttp
-import aiofiles
+from playwright.async_api import Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 load_dotenv()
 
@@ -24,10 +25,10 @@ async def authenticate_and_login(crawler, session_id):
     # Custom hook for login process
     async def login_hook(page: Page, context: BrowserContext, **kwargs):
         await page.goto(LOGIN_URL)
-        await page.fill("#userName", username)
-        await page.fill("#password", password)
-        await page.click("button:has-text('Log In')")
-        await page.wait_for_selector("h2:has-text('My Courses')", timeout=15000)
+        await page.get_by_label("Username").fill(username)
+        await page.get_by_label("Password").fill(password)
+        await page.get_by_role("button", name="Log In").click()
+        await page.get_by_role("heading", name="My Courses").wait_for(state="visible", timeout=15000)
         print("Successfully logged in")
         return page
     
@@ -112,7 +113,6 @@ async def get_unit_content(page: Page):
         if await html_block.count() > 0:
             html_attr = await html_block.get_attribute("html")
             if html_attr:
-                import html
                 unit_description = html.unescape(html_attr)
                 print(f"  Found content in d2l-html-block html attribute")
         
@@ -132,111 +132,79 @@ async def get_unit_content(page: Page):
         'url': page.url
     }
 
-async def download_pdf_file_direct(page: Page, topic_info):
-    """Download PDF file directly using the src URL from d2l-pdf-viewer"""
-    
-    iframe = page.frame_locator('.d2l-fra-iframe iframe')
-    
-    pdf_viewer = iframe.locator("d2l-pdf-viewer").first
-    if await pdf_viewer.count() == 0:
-        print("  PDF viewer not found")
-        return None
-    await pdf_viewer.wait_for(state="visible", timeout=10000)
-    
-    pdf_src_path = await pdf_viewer.get_attribute("src")
-    if not pdf_src_path:
-        print("  PDF src URL not found in d2l-pdf-viewer")
-        return None
-    
-    if pdf_src_path.startswith('/'):
-        base_url = "https://courses.lastingerlearning.com"
-        pdf_src_url = f"{base_url}{pdf_src_path}"
-    elif pdf_src_path.startswith('http'):
-        pdf_src_url = pdf_src_path
-    else:
-        pdf_src_url = urljoin(page.url, pdf_src_path)
-    
-    print(f"  Found PDF URL: {pdf_src_url}")
-    
-    temp_dir = os.path.join(os.getcwd(), 'temp_downloads')
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    title_clean = re.sub(r'[^\w\s-]', '', topic_info['title']).strip()
-    title_clean = re.sub(r'[-\s]+', '_', title_clean)
-    suggested_filename = None
-    if pdf_src_url:
-        url_path = urllib.parse.urlparse(pdf_src_url).path
-        if url_path:
-            suggested_filename = os.path.basename(url_path)
-            suggested_filename = urllib.parse.unquote(suggested_filename)
-    
-    # Fallback to topic-based filename
-    if not suggested_filename or not suggested_filename.endswith('.pdf'):
-        suggested_filename = f"{title_clean}_{topic_info['id']}.pdf"
-    
-    # Clean filename to avoid invalid characters
-    suggested_filename = re.sub(r'[<>:"/\\|?*]', '_', suggested_filename)
-    
-    temp_path = os.path.join(temp_dir, suggested_filename)
-    print(f"  � Will save to: {temp_path}")
+async def get_pdf_download_info(page: Page, topic_info):
+    """Extract PDF download information for save_content to handle"""
+    print(f"  Preparing PDF download info: {topic_info['title']}")
     
     try:
-        # Get browser context to access cookies and session
-        context = page.context
-        cookies = await context.cookies()
-        
-        # Create a cookie string for the request
-        cookie_string = "; ".join([f"{cookie.get('name', '')}={cookie.get('value', '')}" for cookie in cookies if cookie.get('name')])
-        
-        # Set up headers to mimic the browser request
-        headers = {
-            'User-Agent': await page.evaluate('() => navigator.userAgent'),
-            'Referer': page.url,
-            'Cookie': cookie_string,
-            'Accept': 'application/pdf,application/octet-stream,*/*'
-        }
-        
-        print("  Downloading PDF using direct URL...")
-        
-        # Download the PDF using aiohttp with session cookies
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(pdf_src_url) as response:
-                if response.status == 200:
-                    # Check if it's actually a PDF
-                    content_type = response.headers.get('content-type', '')
-                    if 'pdf' not in content_type.lower() and not pdf_src_url.endswith('.pdf'):
-                        print(f"  Warning: Content-Type is '{content_type}', might not be a PDF")
-                    
-                    # Write the PDF content to file
-                    async with aiofiles.open(temp_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            await f.write(chunk)
-                    
-                    # Verify file was created and has content
-                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                        print(f"  PDF downloaded successfully: {temp_path} ({os.path.getsize(temp_path)} bytes)")
-                        return temp_path
-                    else:
-                        print(f"  PDF file was not created or is empty")
-                        return None
-                        
-                else:
-                    print(f"  Failed to download PDF: HTTP {response.status}")
-                    return None
-                    
+        iframe = page.frame_locator('.d2l-fra-iframe iframe')
+        pdf_viewer = iframe.locator("d2l-pdf-viewer").first
+        await pdf_viewer.wait_for(state="visible", timeout=15000)
+
+        hover_target = pdf_viewer.locator("#viewerContainer").first
+        if await hover_target.count() == 0:
+            hover_target = pdf_viewer.locator("canvas").first
+        if await hover_target.count() == 0:
+            hover_target = pdf_viewer
+
+        await hover_target.hover()
+        await asyncio.sleep(0.1)
+
+        download_button = pdf_viewer.get_by_role("button", name="Download").first
+        await download_button.wait_for(state="visible", timeout=5000)
+            
+        if await download_button.count() > 0:
+            print("  Found download button for PDF")
+            return {
+                'has_download_button': True,
+                'page': page,
+                'iframe': iframe,
+                'pdf_viewer': pdf_viewer,
+                'hover_target': hover_target,
+                'download_button': download_button
+            }
+        else:
+            raise Exception("No download button found")
+            
     except Exception as e:
-        print(f"  Error downloading PDF: {e}")
-        import traceback
-        print(f"  DEBUG: Full traceback:\n{traceback.format_exc()}")
+        print(f"  Error preparing PDF download: {e}")
         return None
 
+async def get_vtt_download_info(page: Page, topic_info):
+    """Prepare VTT download details for save_content to handle"""
+
+    print(f"  Preparing VTT download info: {topic_info['title']}")
+
+    try:
+        iframe = page.frame_locator('.d2l-fra-iframe iframe')
+
+        # Ensure the media player has rendered before interacting
+        await iframe.locator("d2l-content-activity-renderer").first.wait_for(state="visible", timeout=15000)
+
+        settings_button = iframe.get_by_role("button", name="settings")
+        await settings_button.wait_for(state="visible", timeout=10000)
+
+        transcript_menu_item = iframe.locator("#transcript-viewer-menu-item")
+        transcript_download_button = iframe.locator("#video-transcript-download-button")
+        captions_menu_item = iframe.locator('d2l-menu-item[aria-label="Captions (.vtt)"]')
+
+        return {
+            'page': page,
+            'settings_button': settings_button,
+            'transcript_menu_item': transcript_menu_item,
+            'transcript_download_button': transcript_download_button,
+            'captions_menu_item': captions_menu_item
+        }
+    except Exception as e:
+        print(f"  Error preparing VTT download: {e}")
+        return None
 
 
 async def get_topic_content_html(page: Page):
     """Extract topic content HTML from various structures"""
     iframe = page.frame_locator('.d2l-fra-iframe iframe')
     
-    # Get topic name from h1.screen-reader-only (preferred method)
+    # Get topic name from screen reader heading
     heading_element = iframe.locator("h1.screen-reader-only").first
     topic_name = await heading_element.text_content() if await heading_element.count() > 0 else "Unknown Topic"
     topic_name = topic_name.strip() if topic_name else "Unknown Topic"
@@ -254,18 +222,35 @@ async def get_topic_content_html(page: Page):
         fallback_match = re.search(r'/(\d+)(?:/|$)', url)
         topic_id = fallback_match.group(1) if fallback_match else "unknown"
     
-    # Check for video with captions (single iframe structure)
-    caption_menu = iframe.locator("#d2l-menu-item").filter(has_text="Captions (.vtt)")
-    if await caption_menu.count() > 0:
-        # Get the VTT download link
-        vtt_link = await caption_menu.get_attribute("href")
-        return {
-            'type': 'video_with_captions',
-            'title': topic_name,
-            'id': topic_id,
-            'vtt_url': vtt_link,
-            'url': page.url
-        }
+    # Wait for content activity renderer to load before checking for video elements
+    content_renderer = iframe.locator("d2l-content-activity-renderer").first
+    if await content_renderer.count() > 0:
+        print(f"  Found d2l-content-activity-renderer, waiting for content to load...")
+        await content_renderer.wait_for(state="visible", timeout=15000)
+
+        # Wait for track elements to attach before checking (video detection method)
+        track_locator = iframe.locator("track")
+        try:
+            await track_locator.first.wait_for(state="attached", timeout=10000)
+        except PlaywrightTimeoutError:
+            print("  Track element did not appear within timeout window")
+
+        if await track_locator.count() > 0:
+            print(f"  Found track element, detecting video with captions")
+            return {
+                'type': 'video_with_captions',
+                'title': topic_name,
+                'id': topic_id,
+                'url': page.url
+            }
+        else:
+            print(f"  No track element found, detecting video without captions")
+            return {
+                'type': 'video_no_captions',
+                'title': topic_name,
+                'id': topic_id,
+                'url': page.url
+            }
     
     # Check for .jump-to-activity in the outer iframe
     if await iframe.locator(".jump-to-activity").count() > 0:
@@ -282,14 +267,9 @@ async def get_topic_content_html(page: Page):
     # Check for d2l-pdf-viewer in the outer iframe (wait for it to load)
     pdf_viewer = iframe.locator("d2l-pdf-viewer").first
     if await pdf_viewer.count() > 0:
-        # Wait for PDF to load
-        try:
-            await pdf_viewer.wait_for(state="visible", timeout=5000)
-        except:
-            pass  # Continue even if timeout
-        
+        await pdf_viewer.wait_for(state="visible", timeout=5000)
         return {
-            'type': 'pdf_download',
+            'type': 'pdf',
             'title': topic_name,
             'id': topic_id,
             'url': page.url
@@ -301,7 +281,6 @@ async def get_topic_content_html(page: Page):
     
     # For structures with inner iframe, check the remaining content types
     if has_inner_iframe:
-        # 1. Check for .container-fluid (use .first to avoid strict mode violations)
         if await resizing_iframe.locator(".container-fluid").count() > 0:
             container_html = await resizing_iframe.locator(".container-fluid").first.inner_html()
             if container_html and container_html.strip():
@@ -313,7 +292,7 @@ async def get_topic_content_html(page: Page):
                     'url': page.url
                 }
         
-        # 2. Check for .d2l_read_element_1 (direct content under this element)
+        # Check for .d2l_read_element_1 (direct content under this element)
         if await resizing_iframe.locator(".d2l_read_element_1").count() > 0:
             container_html = await resizing_iframe.locator(".d2l_read_element_1").first.inner_html()
             if container_html and container_html.strip():
@@ -335,25 +314,6 @@ async def get_topic_content_html(page: Page):
                 'content_html': container_html,
                 'url': page.url
             }
-    
-    # Check for video elements in outer iframe (for videos without captions)
-    video_elements = await iframe.locator("video, iframe[src*='youtube'], iframe[src*='vimeo'], iframe[src*='video']").count()
-    if video_elements > 0:
-        return {
-            'type': 'video_no_captions',
-            'title': topic_name,
-            'id': topic_id,
-            'url': page.url
-        }
-    
-    # If no specific content type detected but we have a title, it might be a video without captions
-    if topic_name != "Unknown Topic" and not has_inner_iframe:
-        return {
-            'type': 'video_no_captions',
-            'title': topic_name,
-            'id': topic_id,
-            'url': page.url
-        }
     
     return None
 
@@ -397,38 +357,23 @@ async def scrape_topic_content(crawler, session_id, topic_info):
     print(f"Processing {topic_info['type']} content: {topic_info['title']}")
     
     if topic_info['type'] == 'video_with_captions':
-        # For videos with captions, download the VTT file
-        if 'vtt_url' in topic_info and topic_info['vtt_url']:
-            try:
-                config = CrawlerRunConfig(
-                    session_id=session_id,
-                    cache_mode=CacheMode.BYPASS,
-                    wait_until="networkidle",
-                    page_timeout=30000
-                )
-                
-                result = await crawler.arun(topic_info['vtt_url'], config=config)
-                topic_info['content'] = result.html if result.html else "VTT content not available"
-                topic_info['content_type'] = 'vtt'
-            except Exception as e:
-                print(f"Failed to download VTT file: {e}")
-                topic_info['content'] = "VTT download failed"
-                topic_info['content_type'] = 'error'
-        else:
-            topic_info['content'] = "VTT URL not found"
-            topic_info['content_type'] = 'error'
+        # For videos with captions using the new d2l-labs-media-player-video detection, 
+        # mark it as needing VTT download
+        topic_info['content_type'] = 'vtt'
+        topic_info['needs_vtt_download'] = True
+        print(f"  Video with captions detected - VTT download will be handled in main loop")
     
     elif topic_info['type'] == 'video_no_captions':
         # For videos without captions, just note that no transcript is available
         topic_info['content'] = f"# {topic_info['title']}\n\nThis is a video content with no available transcript to download."
         topic_info['content_type'] = 'markdown'
     
-    elif topic_info['type'] == 'pdf_download':
+    elif topic_info['type'] == 'pdf':
         # For PDFs, we need to trigger the download and store the file path
         # The actual download will be handled separately by the main scraping loop
         # For now, just mark it as a PDF content type
         topic_info['content_type'] = 'pdf'
-        topic_info['needs_download'] = True
+        topic_info['needs_pdf_download'] = True
         print(f"  PDF detected - download will be handled in main loop")
     
     elif 'content_html' in topic_info:
@@ -492,18 +437,41 @@ async def click_next_iterator(page: Page):
     
     print("Clicking next iterator button...")
     current_url = page.url
+
+    heading_locator = iframe.locator("h1.screen-reader-only").first
+    previous_heading = None
+    if await heading_locator.count() > 0:
+        try:
+            previous_heading = (await heading_locator.text_content()) or None
+        except PlaywrightTimeoutError:
+            previous_heading = None
+
     await next_button.click()
-    
-    # Wait for navigation or content change
+
+    # Wait for navigation to complete
     try:
         await page.wait_for_url(lambda url: url != current_url, timeout=10000)
-        await page.wait_for_load_state("networkidle", timeout=15000)
-        print("Successfully navigated to next item")
-    except:
-        print("Waiting for content to update...")
-        await asyncio.sleep(2)
-        await page.wait_for_selector('.d2l-fra-iframe iframe', timeout=10000)
-        print("Content updated")
+    except PlaywrightTimeoutError:
+        print("  URL did not change after iterator click; continuing with iframe checks")
+
+    if previous_heading:
+        heading_changed = False
+        for _ in range(30):
+            try:
+                current_heading = await heading_locator.text_content()
+            except PlaywrightTimeoutError:
+                current_heading = None
+
+            if current_heading and current_heading.strip() != previous_heading.strip():
+                heading_changed = True
+                break
+
+            await asyncio.sleep(0.5)
+
+        if not heading_changed:
+            print("  Heading did not change after iterator click; proceeding regardless")
+
+    print("Successfully navigated to next item")
     
     return True
 
@@ -527,7 +495,7 @@ async def save_content(content_info, course_info, unit_id=None, output_dir="craw
     elif content_info['type'] == 'video_with_captions' and content_info.get('content_type') == 'vtt':
         type_prefix = "Topic"
         file_extension = ".vtt"
-    elif content_info['type'] == 'pdf_download' and content_info.get('content_type') == 'pdf':
+    elif content_info['type'] == 'pdf' and content_info.get('content_type') == 'pdf':
         type_prefix = "Topic"
         file_extension = ".pdf"
     else:  # All other topic types
@@ -548,25 +516,102 @@ async def save_content(content_info, course_info, unit_id=None, output_dir="craw
     
     # Handle different file types
     if file_extension == ".pdf":
-        # For PDF files, copy from the downloaded file path
-        if content_info.get('pdf_file_path') and os.path.exists(content_info['pdf_file_path']):
-            import shutil
-            shutil.copy2(content_info['pdf_file_path'], filepath)
-            print(f"  Saved PDF: {filename}")
-            
-            # Clean up the temporary file
+        # For PDF files, handle the download directly to final location
+        if content_info.get('pdf_download_info'):
+            download_info = content_info['pdf_download_info']
+            page = download_info['page']
+            download_button = download_info['download_button']
+            pdf_viewer = download_info.get('pdf_viewer')
+            hover_target = download_info.get('hover_target')
+
+            print(f"  Downloading PDF directly to: {filename}")
+
+            target = hover_target or pdf_viewer or download_button
+            if target:
+                try:
+                    await target.hover()
+                    await asyncio.sleep(0.1)
+                except Exception as hover_error:
+                    print(f"  Hover preparation skipped: {hover_error}")
+
             try:
-                os.remove(content_info['pdf_file_path'])
-                # Also try to remove the temp directory if it's empty
-                temp_dir = os.path.dirname(content_info['pdf_file_path'])
-                if os.path.exists(temp_dir) and not os.listdir(temp_dir):
-                    os.rmdir(temp_dir)
+                await download_button.scroll_into_view_if_needed()
+            except Exception as scroll_error:
+                print(f"  Scroll into view skipped: {scroll_error}")
+
+            await download_button.wait_for(state="visible", timeout=5000)
+
+            async with page.expect_download(timeout=30000) as download_ctx:
+                await download_button.evaluate("button => button.click()")
+
+            download = await download_ctx.value
+            await download.save_as(filepath)
+            print(f"  Saved PDF: {filename}")
+
+            if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+                raise Exception(f"PDF download produced empty file: {filename}")
+        else:
+            raise Exception(f"No PDF download info available for: {filename}")
+    elif file_extension == ".vtt":
+        download_info = content_info.get('vtt_download_info')
+
+        if download_info and download_info.get('page'):
+            page = download_info['page']
+            settings_button = download_info['settings_button']
+            transcript_menu_item = download_info['transcript_menu_item']
+            transcript_download_button = download_info['transcript_download_button']
+            captions_menu_item = download_info['captions_menu_item']
+
+            try:
+                print(f"  Downloading VTT via UI sequence: {filename}")
+
+                await settings_button.click()
+
+                await transcript_menu_item.wait_for(state="attached", timeout=10000)
+                await transcript_menu_item.scroll_into_view_if_needed()
+
+                await transcript_menu_item.wait_for(state="visible", timeout=10000)
+                await transcript_menu_item.click()
+
+                await transcript_download_button.wait_for(state="attached", timeout=10000)
+                await transcript_download_button.scroll_into_view_if_needed()
+                await transcript_download_button.wait_for(state="visible", timeout=10000)
+                await transcript_download_button.click()
+
+                await captions_menu_item.wait_for(state="attached", timeout=10000)
+                await captions_menu_item.scroll_into_view_if_needed()
+                await captions_menu_item.wait_for(state="visible", timeout=10000)
+                download_promise = page.wait_for_event('download', timeout=30000)
+                await asyncio.sleep(2)
+                # Use evaluate to trigger native JS click and bypass overlay and Playwright issues
+                await captions_menu_item.evaluate('(element) => element.click()')
+
+                download = await download_promise
+                await download.save_as(filepath)
+                print(f"  Saved VTT: {filename}")
+            except Exception as e:
+                print(f"  VTT download via UI failed: {e}")
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    if content_info.get('content'):
+                        f.write(content_info['content'])
+                    else:
+                        f.write(f"NOTE\nVTT content for: {content_info['title']}\nNo content available.")
+                print(f"  Saved VTT placeholder: {filename}")
+        elif content_info.get('vtt_file_path') and os.path.exists(content_info['vtt_file_path']):
+            shutil.copy2(content_info['vtt_file_path'], filepath)
+            print(f"  Saved VTT: {filename}")
+            
+            try:
+                os.remove(content_info['vtt_file_path'])
             except Exception as e:
                 print(f"  Could not clean up temp file: {e}")
         else:
-            with open(filepath.replace('.pdf', '.md'), 'w', encoding='utf-8') as f:
-                f.write(f"# {content_info['title']}\n\nPDF download failed - file not found.")
-            print(f"  PDF download failed, created placeholder: {filename.replace('.pdf', '.md')}")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                if content_info.get('content'):
+                    f.write(content_info['content'])
+                else:
+                    f.write(f"NOTE\nVTT content for: {content_info['title']}\nNo content available.")
+            print(f"  Saved VTT placeholder: {filename}")
     else:
         # For text files (markdown, vtt, etc.)
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -590,23 +635,10 @@ async def scrape_timeline_content(page: Page, crawler, session_id):
     # Wait for main iframe to be present
     await page.wait_for_selector('.d2l-fra-iframe iframe', timeout=15000)
     
-    # Wait for iframe content to be loaded using a JavaScript condition
-    await page.wait_for_function("""
-        () => {
-            const iframe = document.querySelector('.d2l-fra-iframe iframe');
-            if (!iframe) return false;
-            
-            const iframeDoc = iframe.contentDocument;
-            if (!iframeDoc) return false;
-            
-            // Check if either heading or iterator button is present and visible
-            const heading = iframeDoc.querySelector('.d2l-heading-1');
-            const iterator = iframeDoc.querySelector('#iteratorButtonNext');
-            
-            return (heading && heading.textContent.trim() !== '') || 
-                   (iterator && iterator.offsetParent !== null);
-        }
-    """, timeout=20000)
+    iframe = page.frame_locator('.d2l-fra-iframe iframe')
+    
+    # Wait for iframe content to actually load by waiting for key elements
+    await iframe.locator(".d2l-heading-1, .d2l-heading-2, #iteratorButtonNext").first.wait_for(state="visible", timeout=20000)
     
     print("Timeline content loaded and ready")
     
@@ -653,17 +685,29 @@ async def scrape_timeline_content(page: Page, crawler, session_id):
             topic_info = await scrape_topic_content(crawler, session_id, topic_info)
             
             # Handle PDF downloads if needed
-            if topic_info.get('needs_download') and topic_info['type'] == 'pdf_download':
-                print(f"📥 Downloading PDF: {topic_info['title']}")
+            if topic_info.get('needs_pdf_download') and topic_info['type'] == 'pdf':
+                print(f"📥 Preparing PDF download: {topic_info['title']}")
                 
-                # Try the direct download approach first
-                pdf_file_path = await download_pdf_file_direct(page, topic_info)
+                # Get PDF download information for save_content to handle
+                pdf_download_info = await get_pdf_download_info(page, topic_info)
                 
-                if pdf_file_path:
-                    topic_info['pdf_file_path'] = pdf_file_path
-                    print(f"  PDF download completed using direct URL approach")
+                if pdf_download_info:
+                    topic_info['pdf_download_info'] = pdf_download_info
+                    print(f"  PDF download info prepared")
                 else:
-                    print(f"  Direct PDF download failed")
+                    raise Exception(f"PDF download preparation failed for {topic_info['title']}")
+                    
+            # Handle VTT downloads if needed
+            if topic_info.get('needs_vtt_download') and topic_info['type'] == 'video_with_captions':
+                print(f"📝 Preparing VTT download: {topic_info['title']}")
+
+                vtt_download_info = await get_vtt_download_info(page, topic_info)
+
+                if vtt_download_info:
+                    topic_info['vtt_download_info'] = vtt_download_info
+                    print("  VTT download info prepared")
+                else:
+                    print("  VTT download preparation failed")
             
             print(f"Topic ({topic_info['type']}): {topic_info['title']} (ID: {topic_info['id']}, Unit: {current_unit_id})")
             await save_content(topic_info, course_info, current_unit_id)
@@ -680,16 +724,22 @@ async def scrape_timeline_content(page: Page, crawler, session_id):
             
         # Small delay between iterations
         await asyncio.sleep(1)
+        # await page.wait_for_load_state("networkidle")
     
     return content_count
 
 async def main():
     session_id = "timeline_session"
     
+    # Create downloads directory for temporary PDF downloads
+    downloads_path = os.path.join(os.getcwd(), "downloads")
+    os.makedirs(downloads_path, exist_ok=True)
+    
     browser_config = BrowserConfig(
         headless=False, 
         verbose=True,
-        accept_downloads=True
+        accept_downloads=True,
+        downloads_path=downloads_path
     )
     
     # Initialize crawler manually
@@ -711,9 +761,9 @@ async def main():
                 
             print("Looking for courses to analyze...")
             await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_selector("d2l-enrollment-card", timeout=15000)
-            
+            await page.locator("d2l-enrollment-card").first.wait_for(state="visible", timeout=15000)
             course_elements = await page.locator("d2l-enrollment-card").all()
+            
             if not course_elements:
                 print("No course elements found")
                 return page
@@ -731,7 +781,7 @@ async def main():
                 print(f"  Course title: {title}")
                 
                 # Click course link
-                potential_link = element.locator("d2l-card >> a").first
+                potential_link = element.get_by_role("link").first
                 if await potential_link.count() == 0:
                     print(f"  No clickable link found, skipping course")
                     continue
@@ -744,7 +794,7 @@ async def main():
                 await page.wait_for_load_state("domcontentloaded")
                 print(f"  Navigated to course: {page.url}")
                 
-                timeline_element = page.locator("a:has-text('Timeline')").first
+                timeline_element = page.get_by_role("link", name="Timeline").first
                 await timeline_element.wait_for(state="visible", timeout=15000)
                 
                 if await timeline_element.count() > 0:
@@ -764,8 +814,7 @@ async def main():
                     print(f"  Returning to homepage for next course...")
                     await page.goto(HOMEPAGE_URL)
                     await page.wait_for_load_state("domcontentloaded")
-                    await page.wait_for_selector("d2l-enrollment-card", timeout=15000)
-                    
+                    await page.locator("d2l-enrollment-card").first.wait_for(state="visible", timeout=15000)
                     course_elements = await page.locator("d2l-enrollment-card").all()
                     print(f"  Back at homepage, ready for next course")
             
@@ -781,7 +830,6 @@ async def main():
             cache_mode=CacheMode.BYPASS,
             wait_until="domcontentloaded",
             page_timeout=20000,
-            process_iframes=True,
             excluded_selector="#readspeaker_button_1",
             markdown_generator=DefaultMarkdownGenerator()
         )
@@ -794,6 +842,14 @@ async def main():
     finally:
         await crawler.close()
         print("Crawler closed")
+
+        # Clean up downloads directory
+        if os.path.exists(downloads_path):
+            try:
+                shutil.rmtree(downloads_path)
+                print("Cleaned up downloads directory")
+            except Exception as e:
+                print(f"Could not clean up downloads directory: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
