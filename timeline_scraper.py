@@ -1,11 +1,9 @@
 import asyncio
 import html
+import json
 import os
 import re
 import shutil
-import traceback
-import urllib.parse
-from urllib.parse import urljoin
 from dotenv import load_dotenv
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, DefaultMarkdownGenerator
 from playwright.async_api import Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
@@ -292,7 +290,6 @@ async def get_topic_content_html(page: Page):
                 
                 if data_panels:
                     print(f"  Found d2l-cplus-accordion element with data-panels attribute")
-                    import json
                     
                     # HTML-unescape the JSON string
                     unescaped_panels = html.unescape(data_panels)
@@ -362,7 +359,6 @@ async def get_topic_content_html(page: Page):
                 
                 if data_tabs:
                     print(f"  Found d2l-cplus-tabs-container element with data-tabs-data attribute")
-                    import json
                     
                     # HTML-unescape the JSON string
                     unescaped_tabs = html.unescape(data_tabs)
@@ -389,6 +385,59 @@ async def get_topic_content_html(page: Page):
                     except json.JSONDecodeError as e:
                         print(f"  Failed to parse tabs data-tabs-data JSON: {e}")
             
+            # Check for d2l-cplus-flipcards elements and extract from data-rows attribute
+            flipcards = resizing_iframe.locator("d2l-cplus-flipcards").first
+            if await flipcards.count() > 0:
+                data_rows = await flipcards.get_attribute("data-rows")
+                data_instructions = await flipcards.get_attribute("data-instructions")
+                
+                if data_rows:
+                    print(f"  Found d2l-cplus-flipcards element with data-rows attribute")
+                    
+                    # HTML-unescape the JSON string
+                    unescaped_rows = html.unescape(data_rows)
+                    
+                    try:
+                        rows = json.loads(unescaped_rows)
+                        
+                        # Build flipcards HTML with front and back content
+                        flipcards_html = ""
+                        if data_instructions:
+                            flipcards_html += f"<p><strong>{html.unescape(data_instructions)}</strong></p>\n"
+                        
+                        # Flatten the rows structure (it's a 2D array)
+                        card_count = 0
+                        for row in rows:
+                            for card in row:
+                                card_count += 1
+                                front_title = card.get('frontTitle', '')
+                                front_text = card.get('frontText', '')
+                                back_title = card.get('backTitle', '')
+                                back_text = card.get('backText', '')
+                                
+                                # Add front side
+                                if front_title:
+                                    flipcards_html += f"<h3>{front_title}</h3>\n"
+                                if front_text:
+                                    flipcards_html += f"<p>{front_text}</p>\n"
+                                
+                                # Add back side
+                                if back_title:
+                                    flipcards_html += f"<h4>{back_title}</h4>\n"
+                                if back_text:
+                                    flipcards_html += f"<p>{back_text}</p>\n"
+                                
+                                flipcards_html += "\n"
+                        
+                        # Get the outer HTML of the flipcards element to replace it in container_html
+                        flipcards_outer_html = await flipcards.evaluate("el => el.outerHTML")
+                        
+                        # Replace the flipcards element with extracted content
+                        container_html = container_html.replace(flipcards_outer_html, flipcards_html)
+                        print(f"  Extracted {card_count} flip cards")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse flipcards data-rows JSON: {e}")
+            
             if container_html and container_html.strip():
                 return {
                     'type': 'container_fluid',
@@ -398,9 +447,150 @@ async def get_topic_content_html(page: Page):
                     'url': page.url
                 }
         
-        # Check for .d2l_read_element_1 (direct content under this element)
-        if await resizing_iframe.locator(".d2l_read_element_1").count() > 0:
-            container_html = await resizing_iframe.locator(".d2l_read_element_1").first.inner_html()
+        # Check for #d2l_read_element_1 (direct content under this element)
+        if await resizing_iframe.locator("#d2l_read_element_1").count() > 0:
+            container_html = await resizing_iframe.locator("#d2l_read_element_1").first.inner_html()
+            
+            # Check for d2l-cplus-accordion elements and extract from data-panels attribute
+            accordion = resizing_iframe.locator("d2l-cplus-accordion").first
+            if await accordion.count() > 0:
+                data_panels = await accordion.get_attribute("data-panels")
+                data_instructions = await accordion.get_attribute("data-instructions")
+                
+                if data_panels:
+                    print(f"  Found d2l-cplus-accordion element in d2l_read_element_1")
+                    
+                    unescaped_panels = html.unescape(data_panels)
+                    
+                    try:
+                        panels = json.loads(unescaped_panels)
+                        
+                        accordion_html = ""
+                        if data_instructions:
+                            accordion_html += f"<p><strong>{html.unescape(data_instructions)}</strong></p>\n"
+                        
+                        for panel in panels:
+                            panel_title = panel.get('title', '')
+                            panel_content = panel.get('content', '')
+                            accordion_html += f"<h3>{panel_title}</h3>\n{panel_content}\n"
+                        
+                        accordion_outer_html = await accordion.evaluate("el => el.outerHTML")
+                        container_html = container_html.replace(accordion_outer_html, accordion_html)
+                        print(f"  Extracted {len(panels)} accordion panels")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse accordion data-panels JSON: {e}")
+            
+            # Check for .accordion class elements and extract from .card-title and .card-body
+            has_card_titles = await resizing_iframe.locator(".accordion .card-title").count() > 0
+            has_card_bodies = await resizing_iframe.locator(".accordion .card-body").count() > 0
+            
+            if has_card_titles or has_card_bodies:
+                print(f"  Found .accordion element in d2l_read_element_1")
+                bootstrap_accordion = resizing_iframe.locator(".accordion").first
+                card_titles = await resizing_iframe.locator(".accordion .card-title").all()
+                card_bodies = await resizing_iframe.locator(".accordion .card-body").all()
+                
+                accordion_html = ""
+                
+                for i in range(max(len(card_titles), len(card_bodies))):
+                    if i < len(card_titles):
+                        card_title_element = card_titles[i]
+                        card_title_text = await card_title_element.text_content()
+                        if card_title_text and card_title_text.strip():
+                            accordion_html += f"<h3>{card_title_text.strip()}</h3>\n"
+                    
+                    if i < len(card_bodies):
+                        card_body_element = card_bodies[i]
+                        card_body_html = await card_body_element.inner_html()
+                        accordion_html += f"{card_body_html}\n"
+                
+                if accordion_html.strip():
+                    accordion_outer_html = await bootstrap_accordion.evaluate("el => el.outerHTML")
+                    container_html = container_html.replace(accordion_outer_html, accordion_html)
+                    print(f"  Extracted {len(card_titles)} titles and {len(card_bodies)} card-body sections")
+            
+            # Check for d2l-cplus-tabs-container elements and extract from data-tabs-data attribute
+            tabs_container = resizing_iframe.locator("d2l-cplus-tabs-container").first
+            if await tabs_container.count() > 0:
+                data_tabs = await tabs_container.get_attribute("data-tabs-data")
+                data_instruction = await tabs_container.get_attribute("data-instruction")
+                
+                if data_tabs:
+                    print(f"  Found d2l-cplus-tabs-container element in d2l_read_element_1")
+                    
+                    unescaped_tabs = html.unescape(data_tabs)
+                    
+                    try:
+                        tabs = json.loads(unescaped_tabs)
+                        
+                        tabs_html = ""
+                        if data_instruction:
+                            tabs_html += f"<p><strong>{html.unescape(data_instruction)}</strong></p>\n"
+                        
+                        for tab in tabs:
+                            tab_title = tab.get('title', '')
+                            tab_content = tab.get('content', '')
+                            tabs_html += f"<h3>{tab_title}</h3>\n{tab_content}\n"
+                        
+                        tabs_outer_html = await tabs_container.evaluate("el => el.outerHTML")
+                        container_html = container_html.replace(tabs_outer_html, tabs_html)
+                        print(f"  Extracted {len(tabs)} tab sections")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse tabs data-tabs-data JSON: {e}")
+            
+            # Check for d2l-cplus-flipcards elements and extract from data-rows attribute
+            flipcards = resizing_iframe.locator("d2l-cplus-flipcards").first
+            if await flipcards.count() > 0:
+                data_rows = await flipcards.get_attribute("data-rows")
+                data_instructions = await flipcards.get_attribute("data-instructions")
+                
+                if data_rows:
+                    print(f"  Found d2l-cplus-flipcards element in d2l_read_element_1")
+                    
+                    # HTML-unescape the JSON string
+                    unescaped_rows = html.unescape(data_rows)
+                    
+                    try:
+                        rows = json.loads(unescaped_rows)
+                        
+                        # Build flipcards HTML with front and back content
+                        flipcards_html = ""
+                        if data_instructions:
+                            flipcards_html += f"<p><strong>{html.unescape(data_instructions)}</strong></p>\n"
+                        
+                        # Flatten the rows structure (it's a 2D array)
+                        card_count = 0
+                        for row in rows:
+                            for card in row:
+                                card_count += 1
+                                front_title = card.get('frontTitle', '')
+                                front_text = card.get('frontText', '')
+                                back_title = card.get('backTitle', '')
+                                back_text = card.get('backText', '')
+                                
+                                # Add front side
+                                if front_title:
+                                    flipcards_html += f"<h3>{front_title}</h3>\n"
+                                if front_text:
+                                    flipcards_html += f"<p>{front_text}</p>\n"
+                                
+                                # Add back side
+                                if back_title:
+                                    flipcards_html += f"<h4>{back_title}</h4>\n"
+                                if back_text:
+                                    flipcards_html += f"<p>{back_text}</p>\n"
+                                
+                                flipcards_html += "\n"
+                        
+                        # Get the outer HTML of the flipcards element to replace it in container_html
+                        flipcards_outer_html = await flipcards.evaluate("el => el.outerHTML")
+                        
+                        # Replace the flipcards element with extracted content
+                        container_html = container_html.replace(flipcards_outer_html, flipcards_html)
+                        print(f"  Extracted {card_count} flip cards")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse flipcards data-rows JSON: {e}")
+            
             if container_html and container_html.strip():
                 return {
                     'type': 'd2l_read_element',
