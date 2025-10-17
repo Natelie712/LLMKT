@@ -320,34 +320,74 @@ async def get_topic_content_html(page: Page):
                         print(f"  Failed to parse accordion data-panels JSON: {e}")
             
             # Check for .accordion class elements and extract from .card-title and .card-body
-            bootstrap_accordion = resizing_iframe.locator(".accordion").first
-            if await bootstrap_accordion.count() > 0:
-                print(f"  Found .accordion element, extracting card content")
+            # First check if accordion with card structure exists using count() with short timeout
+            has_card_titles = await resizing_iframe.locator(".accordion .card-title").count() > 0
+            has_card_bodies = await resizing_iframe.locator(".accordion .card-body").count() > 0
+            
+            if has_card_titles or has_card_bodies:
+                print(f"  Found .accordion element with card structure, extracting content")
+                bootstrap_accordion = resizing_iframe.locator(".accordion").first
                 card_titles = await resizing_iframe.locator(".accordion .card-title").all()
                 card_bodies = await resizing_iframe.locator(".accordion .card-body").all()
                 
-                if card_titles or card_bodies:
-                    accordion_html = ""
+                accordion_html = ""
+                
+                # Match titles with bodies (they should be in the same order)
+                for i in range(max(len(card_titles), len(card_bodies))):
+                    if i < len(card_titles):
+                        card_title_element = card_titles[i]
+                        card_title_text = await card_title_element.text_content()
+                        if card_title_text and card_title_text.strip():
+                            accordion_html += f"<h3>{card_title_text.strip()}</h3>\n"
                     
-                    # Match titles with bodies (they should be in the same order)
-                    for i in range(max(len(card_titles), len(card_bodies))):
-                        if i < len(card_titles):
-                            card_title_element = card_titles[i]
-                            card_title_text = await card_title_element.text_content()
-                            if card_title_text and card_title_text.strip():
-                                accordion_html += f"<h3>{card_title_text.strip()}</h3>\n"
-                        
-                        if i < len(card_bodies):
-                            card_body_element = card_bodies[i]
-                            card_body_html = await card_body_element.inner_html()
-                            accordion_html += f"{card_body_html}\n"
-                    
+                    if i < len(card_bodies):
+                        card_body_element = card_bodies[i]
+                        card_body_html = await card_body_element.inner_html()
+                        accordion_html += f"{card_body_html}\n"
+                
+                # Only replace if we successfully extracted content
+                if accordion_html.strip():
                     # Get the outer HTML of the accordion element to replace it in container_html
                     accordion_outer_html = await bootstrap_accordion.evaluate("el => el.outerHTML")
                     
                     # Replace the accordion element with extracted content
                     container_html = container_html.replace(accordion_outer_html, accordion_html)
                     print(f"  Extracted {len(card_titles)} titles and {len(card_bodies)} card-body sections")
+            
+            # Check for d2l-cplus-tabs-container elements and extract from data-tabs-data attribute
+            tabs_container = resizing_iframe.locator("d2l-cplus-tabs-container").first
+            if await tabs_container.count() > 0:
+                data_tabs = await tabs_container.get_attribute("data-tabs-data")
+                data_instruction = await tabs_container.get_attribute("data-instruction")
+                
+                if data_tabs:
+                    print(f"  Found d2l-cplus-tabs-container element with data-tabs-data attribute")
+                    import json
+                    
+                    # HTML-unescape the JSON string
+                    unescaped_tabs = html.unescape(data_tabs)
+                    
+                    try:
+                        tabs = json.loads(unescaped_tabs)
+                        
+                        # Build tabs HTML with titles and content
+                        tabs_html = ""
+                        if data_instruction:
+                            tabs_html += f"<p><strong>{html.unescape(data_instruction)}</strong></p>\n"
+                        
+                        for tab in tabs:
+                            tab_title = tab.get('title', '')
+                            tab_content = tab.get('content', '')
+                            tabs_html += f"<h3>{tab_title}</h3>\n{tab_content}\n"
+                        
+                        # Get the outer HTML of the tabs container element to replace it in container_html
+                        tabs_outer_html = await tabs_container.evaluate("el => el.outerHTML")
+                        
+                        # Replace the tabs container element with extracted content
+                        container_html = container_html.replace(tabs_outer_html, tabs_html)
+                        print(f"  Extracted {len(tabs)} tab sections")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse tabs data-tabs-data JSON: {e}")
             
             if container_html and container_html.strip():
                 return {
