@@ -426,6 +426,162 @@ async def process_interactive_elements(resizing_iframe, container_html):
                 container_html = container_html.replace(tabs_wrapper_outer_html, combined_html)
                 print(f"  Extracted {len(tab_panes)} tab panes with labels")
     
+    # Check for practice questions (each in its own .d2l-practice container)
+    practice_containers = await resizing_iframe.locator(".d2l-practice").all()
+    if practice_containers:
+        print(f"  Found {len(practice_containers)} .d2l-practice container(s), checking for questions...")
+        
+        # Define all practice question types to check
+        question_types = [
+            "d2l-practice-question-true-or-false",
+            "d2l-practice-question-multiple-choice",
+            "d2l-practice-question-multiple-select",
+            "d2l-practice-sorting"
+        ]
+        
+        # Scroll to the bottom of the inner iframe to trigger lazy loading of questions
+        print(f"  Scrolling to bottom of page to trigger question loading...")
+        try:
+            # Try multiple scroll strategies to ensure lazy loading triggers
+            # Strategy 1: Scroll window using the html element
+            await resizing_iframe.locator("html").evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(0.5)
+            
+            # Strategy 2: Scroll each practice container into view
+            for container in practice_containers:
+                await container.scroll_into_view_if_needed()
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            print(f"  Warning: Could not scroll: {e}")
+        
+        # Wait for at least one question element to appear
+        question_loaded = False
+        for question_type in question_types:
+            try:
+                await resizing_iframe.locator(question_type).first.wait_for(state="attached", timeout=15000)
+                print(f"  First {question_type} question detected")
+                question_loaded = True
+                break
+            except PlaywrightTimeoutError:
+                continue
+        
+        if not question_loaded:
+            print(f"  Warning: No practice question elements found after waiting")
+        else:
+            # Progressively scroll and wait to load all questions
+            print(f"  Scrolling through content to load all questions...")
+            print(f"  Total practice containers found: {len(practice_containers)}")
+            previous_count = 0
+            max_attempts = 30
+            stable_count = 0
+            
+            for attempt in range(max_attempts):
+                current_count = 0
+                for question_type in question_types:
+                    current_count += await resizing_iframe.locator(question_type).count()
+                
+                if current_count > previous_count:
+                    print(f"    Loaded {current_count} question(s) so far...")
+                    previous_count = current_count
+                    stable_count = 0
+                    
+                    # Scroll down more using window.scrollBy for incremental scrolling
+                    await resizing_iframe.locator("html").evaluate("() => window.scrollBy(0, 500)")
+                    await asyncio.sleep(0.8)
+                else:
+                    stable_count += 1
+                    if stable_count >= 5:
+                        print(f"    No new questions loaded for 5 attempts, stopping scroll")
+                        break
+                    else:
+                        print(f"    No new questions this attempt (stable: {stable_count}/5), continuing scroll...")
+                        await resizing_iframe.locator("html").evaluate("() => window.scrollBy(0, 500)")
+                        await asyncio.sleep(0.8)
+            
+            print(f"  Final question count: {previous_count}")
+            print(f"  Expected {len(practice_containers)} containers, loaded {previous_count} questions")
+        
+        practice_html = ""
+        total_questions = 0
+        
+        for question_type in question_types:
+            questions = await resizing_iframe.locator(question_type).all()
+            if questions:
+                print(f"  Extracting {len(questions)} {question_type} question(s)")
+                for idx, question in enumerate(questions, 1):
+                    # Extract content from shadow DOM
+                    try:
+                        question_content = await question.evaluate("""
+                            (element) => {
+                                // Try to get shadow root content
+                                if (element.shadowRoot) {
+                                    return element.shadowRoot.innerHTML;
+                                }
+                                // Fallback to regular innerHTML
+                                return element.innerHTML;
+                            }
+                        """)
+                    except Exception as e:
+                        print(f"    Warning: Could not extract question content: {e}")
+                        question_content = await question.inner_html()
+                    
+                    # For sorting questions, extract sortable items
+                    sortable_items_html = ""
+                    if question_type == "d2l-practice-sorting":
+                        try:
+                            sortable_items = await question.evaluate("""
+                                (element) => {
+                                    if (!element.shadowRoot) return [];
+                                    
+                                    const sortItemsContainer = element.shadowRoot.querySelector('.d2l-sort-items-container');
+                                    if (!sortItemsContainer) return [];
+                                    
+                                    const sortableElements = sortItemsContainer.querySelectorAll('d2l-sortable');
+                                    const items = [];
+                                    
+                                    sortableElements.forEach((sortable, index) => {
+                                        const titleText = sortable.getAttribute('titletext');
+                                        if (titleText) {
+                                            items.push({
+                                                index: index + 1,
+                                                text: titleText
+                                            });
+                                        }
+                                    });
+                                    
+                                    return items;
+                                }
+                            """)
+                            
+                            if sortable_items and len(sortable_items) > 0:
+                                sortable_items_html = "<div class='sortable-items'>\n<strong>Sortable Items:</strong>\n<ol>\n"
+                                for item in sortable_items:
+                                    sortable_items_html += f"<li>{item['text']}</li>\n"
+                                sortable_items_html += "</ol>\n</div>\n"
+                                print(f"    Extracted {len(sortable_items)} sortable items")
+                        except Exception as e:
+                            print(f"    Warning: Could not extract sortable items: {e}")
+                    
+                    practice_html += f"<div class='practice-question {question_type}'>\n"
+                    practice_html += f"<h4>Question {total_questions + idx} ({question_type.replace('d2l-practice-question-', '').replace('-', ' ').title()})</h4>\n"
+                    practice_html += f"{question_content}\n"
+                    if sortable_items_html:
+                        practice_html += sortable_items_html
+                    practice_html += f"</div>\n\n"
+                total_questions += len(questions)
+        
+        if practice_html:
+            # Replace all .d2l-practice containers with the extracted content
+            for practice_container in practice_containers:
+                practice_outer_html = await practice_container.evaluate("el => el.outerHTML")
+                container_html = container_html.replace(practice_outer_html, "", 1)
+            
+            # Add all extracted questions at the end
+            container_html += f"\n<div class='practice-questions-extracted'>\n<h3>Practice Questions</h3>\n{practice_html}</div>"
+            print(f"  Successfully extracted {total_questions} practice question(s) total")
+        else:
+            print(f"  No practice questions extracted")
+    
     return container_html
 
 async def get_topic_content_html(page: Page):
