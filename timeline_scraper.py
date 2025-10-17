@@ -283,6 +283,72 @@ async def get_topic_content_html(page: Page):
     if has_inner_iframe:
         if await resizing_iframe.locator(".container-fluid").count() > 0:
             container_html = await resizing_iframe.locator(".container-fluid").first.inner_html()
+            
+            # Check for d2l-cplus-accordion elements and extract from data-panels attribute
+            accordion = resizing_iframe.locator("d2l-cplus-accordion").first
+            if await accordion.count() > 0:
+                data_panels = await accordion.get_attribute("data-panels")
+                data_instructions = await accordion.get_attribute("data-instructions")
+                
+                if data_panels:
+                    print(f"  Found d2l-cplus-accordion element with data-panels attribute")
+                    import json
+                    
+                    # HTML-unescape the JSON string
+                    unescaped_panels = html.unescape(data_panels)
+                    
+                    try:
+                        panels = json.loads(unescaped_panels)
+                        
+                        # Build accordion HTML with titles and content
+                        accordion_html = ""
+                        if data_instructions:
+                            accordion_html += f"<p><strong>{html.unescape(data_instructions)}</strong></p>\n"
+                        
+                        for panel in panels:
+                            panel_title = panel.get('title', '')
+                            panel_content = panel.get('content', '')
+                            accordion_html += f"<h3>{panel_title}</h3>\n{panel_content}\n"
+                        
+                        # Get the outer HTML of the accordion element to replace it in container_html
+                        accordion_outer_html = await accordion.evaluate("el => el.outerHTML")
+                        
+                        # Replace the accordion element with extracted content
+                        container_html = container_html.replace(accordion_outer_html, accordion_html)
+                        print(f"  Extracted {len(panels)} accordion panels")
+                    except json.JSONDecodeError as e:
+                        print(f"  Failed to parse accordion data-panels JSON: {e}")
+            
+            # Check for .accordion class elements and extract from .card-title and .card-body
+            bootstrap_accordion = resizing_iframe.locator(".accordion").first
+            if await bootstrap_accordion.count() > 0:
+                print(f"  Found .accordion element, extracting card content")
+                card_titles = await resizing_iframe.locator(".accordion .card-title").all()
+                card_bodies = await resizing_iframe.locator(".accordion .card-body").all()
+                
+                if card_titles or card_bodies:
+                    accordion_html = ""
+                    
+                    # Match titles with bodies (they should be in the same order)
+                    for i in range(max(len(card_titles), len(card_bodies))):
+                        if i < len(card_titles):
+                            card_title_element = card_titles[i]
+                            card_title_text = await card_title_element.text_content()
+                            if card_title_text and card_title_text.strip():
+                                accordion_html += f"<h3>{card_title_text.strip()}</h3>\n"
+                        
+                        if i < len(card_bodies):
+                            card_body_element = card_bodies[i]
+                            card_body_html = await card_body_element.inner_html()
+                            accordion_html += f"{card_body_html}\n"
+                    
+                    # Get the outer HTML of the accordion element to replace it in container_html
+                    accordion_outer_html = await bootstrap_accordion.evaluate("el => el.outerHTML")
+                    
+                    # Replace the accordion element with extracted content
+                    container_html = container_html.replace(accordion_outer_html, accordion_html)
+                    print(f"  Extracted {len(card_titles)} titles and {len(card_bodies)} card-body sections")
+            
             if container_html and container_html.strip():
                 return {
                     'type': 'container_fluid',
