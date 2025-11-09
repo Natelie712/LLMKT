@@ -27,3 +27,27 @@ python -m playwright install --with-deps chromium
 ```bash
 crawl4ai-doctor
 ```
+
+## Merge-Script
+
+### Run the following to set up a Conda environment:
+
+```bash
+conda create -n merge_env python=3.11 -y
+conda activate merge_env
+```
+
+### Run the following to set up requirements.txt:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Run the merge script:
+
+```bash
+cd merge_script
+# Copy datasets to this folder
+
+python merge_script.py
+```

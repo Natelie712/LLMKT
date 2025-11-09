@@ -12,3 +12,7 @@ aiohttp
 
 # Environment configuration
 python-dotenv
+
+# Data analysis and CSV merging
+pandas
+numpy

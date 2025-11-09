@@ -66,6 +66,9 @@ coverage.xml
 .DS_Store
 Thumbs.db
 
+# CSV data files
+*.csv
+
 # Local environment variables
 *.env
 
