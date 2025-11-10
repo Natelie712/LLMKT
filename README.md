@@ -49,5 +49,5 @@ pip install -r requirements.txt
 cd merge_script
 # Copy datasets to this folder
 
-python merge_script.py
+python merge_all_datasets.py
 ```
