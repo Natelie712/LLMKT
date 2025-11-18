@@ -8,6 +8,7 @@ import gc
 import datetime
 import torch
 import torch.optim as optim
+from sklearn.metrics import roc_auc_score
 from torch.optim import lr_scheduler
 from torch.autograd import Variable
 from models import GKT, MultiHeadAttention, VAE, DKT
@@ -174,22 +175,28 @@ if args.cuda:
 
 
 
-TOTAL_ITEMS = 364  # total number of question slots in the assessment bank (L / Q for completion rate)
+TOTAL_ITEMS = 305  # total number of question slots in the assessment bank (updated from 364 to 305)
 
 
-def _update_fairness_bins(bin_labels, bin_outputs, answers, pred_res, total_items=TOTAL_ITEMS):
+def _update_fairness_bins(bin_labels, bin_outputs, bin_students, answers, pred_res, user_ids, completion_rates, total_items=TOTAL_ITEMS):
     """Accumulate labels and prediction scores into completion-rate bins.
 
     Parameters
     ----------
     bin_labels : list[list[int]]
     bin_outputs : list[list[float]]
+    bin_students : list[set]
+        Set of unique user_ids per bin.
     answers : torch.Tensor, shape [B, L]
         Padded with -1.
     pred_res : torch.Tensor, shape [B, L-1]
         Predicted probabilities for next-step answers.
+    user_ids : list
+        User IDs for each row in the batch.
+    completion_rates : np.ndarray, shape [B]
+        Precomputed GLOBAL completion rates per user (before batching).
     total_items : int
-        Q in completion_rate = L / Q.
+        Q in completion_rate = L / Q. Kept for compatibility if needed.
     """
     if answers is None or pred_res is None:
         return
@@ -217,8 +224,8 @@ def _update_fairness_bins(bin_labels, bin_outputs, answers, pred_res, total_item
         valid = mask_np[i]
         if not valid.any():
             continue
-        L_i = lengths[i]
-        completion_rate = float(L_i) / float(total_items)
+        # Use precomputed GLOBAL completion rate (before batching)
+        completion_rate = float(completion_rates[i])
         # Map [0,1+] -> bins 0..9
         bin_idx = int(completion_rate * 10.0)
         if bin_idx < 0:
@@ -231,15 +238,18 @@ def _update_fairness_bins(bin_labels, bin_outputs, answers, pred_res, total_item
 
         bin_labels[bin_idx].extend(y_true.tolist())
         bin_outputs[bin_idx].extend(y_score.tolist())
+        # Track unique students per bin
+        if bin_students[bin_idx] is not None:
+            bin_students[bin_idx].add(user_ids[i])
 
 
-def _compute_bin_stats(bin_labels, bin_outputs):
-    """Compute TPR/FPR/ACC per non-empty completion bin.
+def _compute_bin_stats(bin_labels, bin_outputs, bin_students):
+    """Compute TPR/FPR/ACC/F1 per non-empty completion bin, with counts.
 
-    Returns
-    -------
-    stats : dict[int, dict[str, float]]
-        stats[bin] = {'tpr': ..., 'fpr': ..., 'acc': ...}
+    Returns stats per bin including:
+      - students: number of unique students in bin
+      - predictions: number of prediction events (valid positions)
+      - f1: F1 score for the bin
     """
     stats = {}
     for b in range(10):
@@ -258,8 +268,20 @@ def _compute_bin_stats(bin_labels, bin_outputs):
         tpr = float(tp) / float(tp + fn) if (tp + fn) > 0 else 0.0
         fpr = float(fp) / float(fp + tn) if (fp + tn) > 0 else 0.0
         acc = float(tp + tn) / float(tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+        
+        # F1 score
+        precision = float(tp) / float(tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tpr  # recall = TPR
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-        stats[b] = {"tpr": tpr, "fpr": fpr, "acc": acc}
+        stats[b] = {
+            "tpr": tpr,
+            "fpr": fpr,
+            "acc": acc,
+            "f1": f1,
+            "predictions": int(y_true.size),
+            "students": int(len(bin_students[b]) if bin_students[b] is not None else 0),
+        }
     return stats
 
 
@@ -285,26 +307,26 @@ def _compute_fairness_from_bins(bin_stats):
 
 
 def _print_fairness_summary(bin_stats, fairness, prefix, log_handle=None):
-    """Print fairness metrics in a clean block (console + optional log)."""
+    """Print fairness metrics with student/prediction counts and F1."""
     lines = []
-    lines.append(f"=== Fairness (by completion bins) [{prefix}] ===")
-    non_empty = fairness.get("non_empty_bins", [])
-    if non_empty:
-        lines.append("Non-empty bins: " + ", ".join(str(b) for b in non_empty))
-    else:
-        lines.append("Non-empty bins: (none)")
+    lines.append("  Fairness per completion-rate bin:")
 
-    for b in sorted(bin_stats.keys()):
+    for b in range(10):
+        if b not in bin_stats:
+            continue
         s = bin_stats[b]
+        low = b * 10
+        high = (b + 1) * 10
         lines.append(
-            f"  Bin {b}: TPR={s['tpr']:.4f}, FPR={s['fpr']:.4f}, ACC={s['acc']:.4f}"
+            f"    Bin {b} ({low:2d}-{high:3d}%): students={s['students']}, predictions={s['predictions']}, "
+            f"TPR={s['tpr']:.3f}, FPR={s['fpr']:.3f}, ACC={s['acc']:.3f}, F1={s['f1']:.3f}"
         )
 
     lines.append(
-        f"EO dist (lowest vs highest non-empty bin): {fairness['eo_dist']:.6f}"
+        f"  Equalized odds distance (lowest vs highest non-empty bin): {fairness['eo_dist']:.4f}"
     )
     lines.append(
-        f"Accuracy variance across bins: {fairness['acc_var']:.6f}"
+        f"  Accuracy variance across bins: {fairness['acc_var']:.6f}"
     )
 
     for line in lines:
@@ -327,10 +349,14 @@ def train(epoch, best_val_loss):
         graph_model.train()
     model.train()
 
+    # accumulate all labels/scores to compute dataset-level AUC/ACC (micro)
+    all_train_labels = []
+    all_train_scores = []
+
     # --------------------
     # Training loop
     # --------------------
-    for batch_idx, (features, questions, answers) in enumerate(train_loader):
+    for batch_idx, (features, questions, answers, _user_ids, _completion_rates) in enumerate(train_loader):
         t1 = time.time()
         if args.cuda:
             features, questions, answers = features.cuda(), questions.cuda(), answers.cuda()
@@ -348,6 +374,15 @@ def train(epoch, best_val_loss):
         if auc != -1 and acc != -1:
             auc_train.append(auc)
             acc_train.append(acc)
+
+        # collect labels/scores for global metrics (masking padded steps)
+        real_answers = answers[:, 1:]
+        answer_mask = torch.ne(real_answers, -1)
+        if answer_mask.sum().item() > 0:
+            y_true_b = real_answers[answer_mask].cpu().detach().numpy().astype(int)
+            y_score_b = pred_res[answer_mask].cpu().detach().numpy().astype(float)
+            all_train_labels.extend(y_true_b.tolist())
+            all_train_scores.extend(y_score_b.tolist())
 
         if args.model == 'GKT' and args.graph_type == 'VAE':
             if args.prior:
@@ -381,12 +416,17 @@ def train(epoch, best_val_loss):
 
     bin_labels = [[] for _ in range(10)]
     bin_outputs = [[] for _ in range(10)]
+    bin_students = [set() for _ in range(10)]
+
+    # accumulate all labels/scores to compute dataset-level AUC/ACC (micro)
+    all_val_labels = []
+    all_val_scores = []
 
     if graph_model is not None:
         graph_model.eval()
     model.eval()
     with torch.no_grad():
-        for batch_idx, (features, questions, answers) in enumerate(valid_loader):
+        for batch_idx, (features, questions, answers, user_ids, completion_rates) in enumerate(valid_loader):
             if args.cuda:
                 features, questions, answers = features.cuda(), questions.cuda(), answers.cuda()
 
@@ -405,6 +445,15 @@ def train(epoch, best_val_loss):
                 auc_val.append(auc)
                 acc_val.append(acc)
 
+            # collect labels/scores for global metrics (masking padded steps)
+            real_answers = answers[:, 1:]
+            answer_mask = torch.ne(real_answers, -1)
+            if answer_mask.sum().item() > 0:
+                y_true_b = real_answers[answer_mask].cpu().detach().numpy().astype(int)
+                y_score_b = pred_res[answer_mask].cpu().detach().numpy().astype(float)
+                all_val_labels.extend(y_true_b.tolist())
+                all_val_scores.extend(y_score_b.tolist())
+
             cur_loss = loss_kt_val
             if args.model == 'GKT' and args.graph_type == 'VAE':
                 if args.prior:
@@ -417,18 +466,79 @@ def train(epoch, best_val_loss):
             loss_val.append(cur_loss)
 
             # update fairness bins
-            _update_fairness_bins(bin_labels, bin_outputs, answers, pred_res, total_items=TOTAL_ITEMS)
+            _update_fairness_bins(
+                bin_labels,
+                bin_outputs,
+                bin_students,
+                answers,
+                pred_res,
+                user_ids,
+                completion_rates,
+                total_items=TOTAL_ITEMS,
+            )
 
     # --------------------
     # Logging
     # --------------------
     mean_loss_train = float(np.mean(loss_train)) if loss_train else 0.0
-    mean_auc_train = float(np.mean(auc_train)) if auc_train else -1.0
-    mean_acc_train = float(np.mean(acc_train)) if acc_train else -1.0
+
+    # compute dataset-level (micro) AUC/ACC/F1 for train
+    if len(all_train_labels) > 0:
+        y_true_all = np.asarray(all_train_labels, dtype=int)
+        y_score_all = np.asarray(all_train_scores, dtype=float)
+        y_pred_all = (y_score_all >= 0.5).astype(int)
+        
+        if np.unique(y_true_all).size == 2:
+            try:
+                mean_auc_train = float(roc_auc_score(y_true_all, y_score_all))
+            except Exception:
+                mean_auc_train = float('nan')
+        else:
+            mean_auc_train = float('nan')
+        
+        mean_acc_train = float((y_pred_all == y_true_all).mean())
+        
+        # F1 for train
+        tp_tr = np.sum((y_true_all == 1) & (y_pred_all == 1))
+        fp_tr = np.sum((y_true_all == 0) & (y_pred_all == 1))
+        fn_tr = np.sum((y_true_all == 1) & (y_pred_all == 0))
+        prec_tr = float(tp_tr) / float(tp_tr + fp_tr) if (tp_tr + fp_tr) > 0 else 0.0
+        rec_tr = float(tp_tr) / float(tp_tr + fn_tr) if (tp_tr + fn_tr) > 0 else 0.0
+        mean_f1_train = 2 * prec_tr * rec_tr / (prec_tr + rec_tr) if (prec_tr + rec_tr) > 0 else 0.0
+    else:
+        mean_auc_train = float('nan')
+        mean_acc_train = float('nan')
+        mean_f1_train = float('nan')
 
     mean_loss_val = float(np.mean(loss_val)) if loss_val else 0.0
-    mean_auc_val = float(np.mean(auc_val)) if auc_val else -1.0
-    mean_acc_val = float(np.mean(acc_val)) if acc_val else -1.0
+
+    # compute dataset-level (micro) AUC/ACC/F1 for validation
+    if len(all_val_labels) > 0:
+        y_true_all_v = np.asarray(all_val_labels, dtype=int)
+        y_score_all_v = np.asarray(all_val_scores, dtype=float)
+        y_pred_all_v = (y_score_all_v >= 0.5).astype(int)
+        
+        if np.unique(y_true_all_v).size == 2:
+            try:
+                mean_auc_val = float(roc_auc_score(y_true_all_v, y_score_all_v))
+            except Exception:
+                mean_auc_val = float('nan')
+        else:
+            mean_auc_val = float('nan')
+        
+        mean_acc_val = float((y_pred_all_v == y_true_all_v).mean())
+        
+        # F1 for validation
+        tp_v = np.sum((y_true_all_v == 1) & (y_pred_all_v == 1))
+        fp_v = np.sum((y_true_all_v == 0) & (y_pred_all_v == 1))
+        fn_v = np.sum((y_true_all_v == 1) & (y_pred_all_v == 0))
+        prec_v = float(tp_v) / float(tp_v + fp_v) if (tp_v + fp_v) > 0 else 0.0
+        rec_v = float(tp_v) / float(tp_v + fn_v) if (tp_v + fn_v) > 0 else 0.0
+        mean_f1_val = 2 * prec_v * rec_v / (prec_v + rec_v) if (prec_v + rec_v) > 0 else 0.0
+    else:
+        mean_auc_val = float('nan')
+        mean_acc_val = float('nan')
+        mean_f1_val = float('nan')
 
     if args.model == 'GKT' and args.graph_type == 'VAE':
         mean_kt_train = float(np.mean(kt_train)) if kt_train else 0.0
@@ -439,18 +549,18 @@ def train(epoch, best_val_loss):
         msg = (
             f"Epoch: {epoch:04d} "
             f"loss_train: {mean_loss_train:.10f} kt_train: {mean_kt_train:.10f} vae_train: {mean_vae_train:.10f} "
-            f"auc_train: {mean_auc_train:.10f} acc_train: {mean_acc_train:.10f} "
+            f"auc_train: {mean_auc_train:.10f} acc_train: {mean_acc_train:.10f} f1_train: {mean_f1_train:.10f} "
             f"loss_val: {mean_loss_val:.10f} kt_val: {mean_kt_val:.10f} vae_val: {mean_vae_val:.10f} "
-            f"auc_val: {mean_auc_val:.10f} acc_val: {mean_acc_val:.10f} "
+            f"auc_val: {mean_auc_val:.10f} acc_val: {mean_acc_val:.10f} f1_val: {mean_f1_val:.10f} "
             f"time: {time.time() - t:.4f}s"
         )
     else:
         msg = (
             f"Epoch: {epoch:04d} "
             f"loss_train: {mean_loss_train:.10f} "
-            f"auc_train: {mean_auc_train:.10f} acc_train: {mean_acc_train:.10f} "
+            f"auc_train: {mean_auc_train:.10f} acc_train: {mean_acc_train:.10f} f1_train: {mean_f1_train:.10f} "
             f"loss_val: {mean_loss_val:.10f} "
-            f"auc_val: {mean_auc_val:.10f} acc_val: {mean_acc_val:.10f} "
+            f"auc_val: {mean_auc_val:.10f} acc_val: {mean_acc_val:.10f} f1_val: {mean_f1_val:.10f} "
             f"time: {time.time() - t:.4f}s"
         )
 
@@ -459,7 +569,7 @@ def train(epoch, best_val_loss):
         print(msg, file=log)
 
     # Fairness summary for validation
-    bin_stats = _compute_bin_stats(bin_labels, bin_outputs)
+    bin_stats = _compute_bin_stats(bin_labels, bin_outputs, bin_students)
     fairness = _compute_fairness_from_bins(bin_stats)
     _print_fairness_summary(bin_stats, fairness, prefix="Validation", log_handle=log if args.save_dir else None)
 
@@ -496,13 +606,18 @@ def test():
 
     bin_labels = [[] for _ in range(10)]
     bin_outputs = [[] for _ in range(10)]
+    bin_students = [set() for _ in range(10)]
+
+    # accumulate all labels/scores to compute dataset-level AUC/ACC/F1 (micro)
+    all_test_labels = []
+    all_test_scores = []
 
     if graph_model is not None:
         graph_model.eval()
     model.eval()
     model.load_state_dict(torch.load(model_file))
     with torch.no_grad():
-        for batch_idx, (features, questions, answers) in enumerate(test_loader):
+        for batch_idx, (features, questions, answers, user_ids, completion_rates) in enumerate(test_loader):
             if args.cuda:
                 features, questions, answers = features.cuda(), questions.cuda(), answers.cuda()
             ec_list, rec_list, z_prob_list = None, None, None
@@ -519,6 +634,15 @@ def test():
                 auc_test.append(auc)
                 acc_test.append(acc)
 
+            # collect labels/scores for global metrics (masking padded steps)
+            real_answers = answers[:, 1:]
+            answer_mask = torch.ne(real_answers, -1)
+            if answer_mask.sum().item() > 0:
+                y_true_b = real_answers[answer_mask].cpu().detach().numpy().astype(int)
+                y_score_b = pred_res[answer_mask].cpu().detach().numpy().astype(float)
+                all_test_labels.extend(y_true_b.tolist())
+                all_test_scores.extend(y_score_b.tolist())
+
             cur_loss = float(loss_kt.cpu().detach().numpy())
             if args.model == 'GKT' and args.graph_type == 'VAE':
                 if args.prior:
@@ -530,7 +654,44 @@ def test():
             loss_test.append(cur_loss)
 
             # accumulate fairness bins
-            _update_fairness_bins(bin_labels, bin_outputs, answers, pred_res, total_items=TOTAL_ITEMS)
+            _update_fairness_bins(
+                bin_labels,
+                bin_outputs,
+                bin_students,
+                answers,
+                pred_res,
+                user_ids,
+                completion_rates,
+                total_items=TOTAL_ITEMS,
+            )
+
+    # compute dataset-level (micro) AUC/ACC/F1 for test
+    if len(all_test_labels) > 0:
+        y_true_all_t = np.asarray(all_test_labels, dtype=int)
+        y_score_all_t = np.asarray(all_test_scores, dtype=float)
+        y_pred_all_t = (y_score_all_t >= 0.5).astype(int)
+        
+        if np.unique(y_true_all_t).size == 2:
+            try:
+                auc_test_global = float(roc_auc_score(y_true_all_t, y_score_all_t))
+            except Exception:
+                auc_test_global = float('nan')
+        else:
+            auc_test_global = float('nan')
+        
+        acc_test_global = float((y_pred_all_t == y_true_all_t).mean())
+        
+        # F1 for test
+        tp_t = np.sum((y_true_all_t == 1) & (y_pred_all_t == 1))
+        fp_t = np.sum((y_true_all_t == 0) & (y_pred_all_t == 1))
+        fn_t = np.sum((y_true_all_t == 1) & (y_pred_all_t == 0))
+        prec_t = float(tp_t) / float(tp_t + fp_t) if (tp_t + fp_t) > 0 else 0.0
+        rec_t = float(tp_t) / float(tp_t + fn_t) if (tp_t + fn_t) > 0 else 0.0
+        f1_test_global = 2 * prec_t * rec_t / (prec_t + rec_t) if (prec_t + rec_t) > 0 else 0.0
+    else:
+        auc_test_global = float('nan')
+        acc_test_global = float('nan')
+        f1_test_global = float('nan')
 
     print('--------------------------------')
     print('--------Testing-----------------')
@@ -540,14 +701,16 @@ def test():
             f"loss_test: {np.mean(loss_test):.10f} "
             f"kt_test: {np.mean(kt_test):.10f} "
             f"vae_test: {np.mean(vae_test):.10f} "
-            f"auc_test: {np.mean(auc_test):.10f} "
-            f"acc_test: {np.mean(acc_test):.10f}"
+            f"auc_test: {auc_test_global:.10f} "
+            f"acc_test: {acc_test_global:.10f} "
+            f"f1_test: {f1_test_global:.10f}"
         )
     else:
         msg = (
             f"loss_test: {np.mean(loss_test):.10f} "
-            f"auc_test: {np.mean(auc_test):.10f} "
-            f"acc_test: {np.mean(acc_test):.10f}"
+            f"auc_test: {auc_test_global:.10f} "
+            f"acc_test: {acc_test_global:.10f} "
+            f"f1_test: {f1_test_global:.10f}"
         )
     print(msg)
     if log is not None:
@@ -557,7 +720,7 @@ def test():
         print(msg, file=log)
 
     # Fairness summary for test
-    bin_stats = _compute_bin_stats(bin_labels, bin_outputs)
+    bin_stats = _compute_bin_stats(bin_labels, bin_outputs, bin_students)
     fairness = _compute_fairness_from_bins(bin_stats)
     _print_fairness_summary(bin_stats, fairness, prefix="Test", log_handle=log)
 
@@ -581,7 +744,7 @@ for epoch in range(args.epochs):
 
 print("Optimization Finished!")
 print("Best Epoch: {:04d}".format(best_epoch))
-if args.save_dir:
+if args.save_dir and log is not None:
     print("Best Epoch: {:04d}".format(best_epoch), file=log)
     log.flush()
 

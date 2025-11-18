@@ -16,6 +16,9 @@ class DKTSequenceDataset(Dataset):
         self.q_seqs = data["q_seqs"]
         self.r_seqs = data["r_seqs"]
         self.seq_lengths = data["seq_lengths"]
+        # Completion rates: STABLE per student, precomputed in preprocessing
+        # Formula: completion_rate = student_questions / TOTAL_Q_SLOTS
+        # Used for fairness binning (same student -> same bin always)
         self.completion_rates = data["completion_rates"]
         self.max_len = max_len
         self.device = device
@@ -43,7 +46,7 @@ class DKTSequenceDataset(Dataset):
             r_pad.to(self.device),
             mask.to(self.device),
             self.users[idx],
-            self.completion_rates[idx],
+            self.completion_rates[idx],  # Stable precomputed rate for fairness
         )
 
 def load_dkt_splits(base_dir, max_len=300, device="cpu"):

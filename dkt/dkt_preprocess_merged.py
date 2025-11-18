@@ -9,13 +9,23 @@
 #       --min_seq_len 3 \
 #       --train_ratio 0.8 --valid_ratio 0.1 --test_ratio 0.1
 #
+# IMPORTANT - CSV Structure (as of latest version):
+#   - Assessment questions: 305 columns (q1_id to q305_id with q*_correct columns)
+#     * Multi-select questions now count as ONE question (not multiple)
+#     * Correctness requires ALL correct choices AND NO incorrect choices
+#   - Grade columns: Pivoted format (grades_<item_name> per grade item)
+#   - Content columns: Topic-specific (content_<topic>_totaltime, etc.)
+#   - EOC Survey columns: Per-question format (eoc_<survey>_q<N>_question/answer)
+#
 # This script:
 #   1. Reads the wide merged CSV where each row is one student / teacher.
-#   2. Extracts ordered question and correctness sequences from qN_* blocks.
-#   3. Maps raw question ids to contiguous indices [0, num_questions - 1].
-#   4. Drops users with short sequences (length < min_seq_len).
-#   5. Splits users into train / valid / test at the user level.
-#   6. Saves the result as pickles plus a small JSON metadata file.
+#   2. Dynamically detects question columns (q*_id) - handles any count.
+#   3. Extracts ordered question and correctness sequences from qN_* blocks.
+#   4. Calculates GLOBAL completion rates (questions_answered / TOTAL_Q_SLOTS).
+#   5. Maps raw question ids to contiguous indices [0, num_questions - 1].
+#   6. Drops users with short sequences (length < min_seq_len).
+#   7. Splits users into train / valid / test at the user level.
+#   8. Saves the result as pickles plus a small JSON metadata file.
 
 import argparse
 import json
@@ -235,7 +245,11 @@ def main():
     q_indices = find_question_indices(list(df.columns))
     print(f"Found {len(q_indices)} question slots: from q{q_indices[0]} to q{q_indices[-1]}")
 
-    TOTAL_Q_SLOTS = len(q_indices)  # used later for completion rate
+    # TOTAL_Q_SLOTS is the GLOBAL constant for completion rate calculation
+    # This represents the maximum possible questions any student could answer
+    # Current CSV structure: 305 questions (multi-select now counts as 1)
+    # Used for fairness metrics: completion_rate = student_questions / TOTAL_Q_SLOTS
+    TOTAL_Q_SLOTS = len(q_indices)
 
     # Define correctness priority for each qN_*
     correctness_priority = [
@@ -285,12 +299,17 @@ def main():
     seq_lengths: List[int] = []
     completion_rates: List[float] = []
 
+    # CRITICAL: Completion rate is a STABLE property calculated ONCE per student
+    # Formula: completion_rate = (total questions answered by student) / TOTAL_Q_SLOTS
+    # This ensures the same student ALWAYS maps to the same fairness bin
+    # regardless of batch composition or sequence chunking
     for q_ids, r_vals in zip(all_qid_strings, all_correctness):
         q_idx_seq = [qid2idx[qid] for qid in q_ids]
         q_seqs_idx.append(q_idx_seq)
         r_seqs_idx.append(list(r_vals))
-        L = len(q_idx_seq)
+        L = len(q_idx_seq)  # Total questions answered by THIS student
         seq_lengths.append(L)
+        # Global completion rate (stable across all batches)
         completion_rates.append(L / float(TOTAL_Q_SLOTS))
 
     # Train / valid / test split at user level
@@ -331,7 +350,7 @@ def main():
     # Save metadata
     meta = {
         "num_questions": num_questions,
-        "total_q_slots": TOTAL_Q_SLOTS,
+        "total_q_slots": TOTAL_Q_SLOTS,  # Global constant for completion rates (305 as of latest CSV)
         "min_seq_len": args.min_seq_len,
         "train_users": len(train_users),
         "valid_users": len(valid_users),

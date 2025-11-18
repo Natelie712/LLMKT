@@ -74,6 +74,7 @@ if __name__ == "__main__":
 
     avg_auc = 0.0
     avg_acc = 0.0
+    avg_f1 = 0.0
 
     # For reproducibility / robustness, do 5 runs with different seeds
     num_runs = 5
@@ -89,7 +90,8 @@ if __name__ == "__main__":
 
             best_acc = 0.0
             best_auc = 0.0
-            best_state = {"auc": 0.0, "acc": 0.0, "loss": 0.0}
+            best_f1 = 0.0
+            best_state = {"auc": 0.0, "acc": 0.0, "f1": 0.0, "loss": 0.0}
 
             model = ReKT(pro_max, skill_max, d, p)
             model = model.to(device)
@@ -103,7 +105,7 @@ if __name__ == "__main__":
 
             for epoch in range(epochs):
                 # Train
-                train_loss, train_acc, train_auc = run_epoch(
+                train_loss, train_acc, train_auc, train_f1 = run_epoch(
                     pro_max,
                     train_path,
                     train_skill_path,
@@ -121,13 +123,14 @@ if __name__ == "__main__":
                     f"epoch: {epoch:03d}, "
                     f"train_loss: {train_loss:.4f}, "
                     f"train_acc: {train_acc:.4f}, "
-                    f"train_auc: {train_auc:.4f}"
+                    f"train_auc: {train_auc:.4f}, "
+                    f"train_f1: {train_f1:.4f}"
                 )
 
                 # Validation: here we reuse the test set as 'valid' set.
                 # If you later create a distinct validation split, point
                 # valid_path/valid_skill_path there instead.
-                valid_loss, valid_acc, valid_auc = run_epoch(
+                valid_loss, valid_acc, valid_auc, valid_f1 = run_epoch(
                     pro_max,
                     test_path,
                     test_skill_path,
@@ -145,15 +148,18 @@ if __name__ == "__main__":
                     f"epoch: {epoch:03d}, "
                     f"valid_loss: {valid_loss:.4f}, "
                     f"valid_acc: {valid_acc:.4f}, "
-                    f"valid_auc: {valid_auc:.4f}"
+                    f"valid_auc: {valid_auc:.4f}, "
+                    f"valid_f1: {valid_f1:.4f}"
                 )
 
                 # Early stopping on AUC
                 if valid_auc >= best_auc:
                     best_auc = valid_auc
                     best_acc = valid_acc
+                    best_f1 = valid_f1
                     best_state["auc"] = valid_auc
                     best_state["acc"] = valid_acc
+                    best_state["f1"] = valid_f1
                     best_state["loss"] = valid_loss
                     epochs_no_improve = 0
                 else:
@@ -163,12 +169,13 @@ if __name__ == "__main__":
                     print(
                         f"Early stopping at epoch {epoch}, "
                         f"best_valid_auc={best_auc:.4f}, "
-                        f"best_valid_acc={best_acc:.4f}"
+                        f"best_valid_acc={best_acc:.4f}, "
+                        f"best_valid_f1={best_f1:.4f}"
                     )
                     break
 
             # After training, evaluate once more on test set
-            test_loss, test_acc, test_auc = run_epoch(
+            test_loss, test_acc, test_auc, test_f1 = run_epoch(
                 pro_max,
                 test_path,
                 test_skill_path,
@@ -185,30 +192,34 @@ if __name__ == "__main__":
 
             print("************************************************************************")
             print(f"Run {run_id + 1}/{num_runs} TEST:")
-            print(f"test_acc: {test_acc:.4f}, test_auc: {test_auc:.4f}")
+            print(f"test_acc: {test_acc:.4f}, test_auc: {test_auc:.4f}, test_f1: {test_f1:.4f}")
             print("************************************************************************")
 
             avg_auc += test_auc
             avg_acc += test_acc
+            avg_f1 += test_f1
 
             # Write per-run summary to file
             file.write(
                 f"Run {run_id + 1}: "
                 f"best_valid_auc={best_auc:.4f}, "
                 f"best_valid_acc={best_acc:.4f}, "
+                f"best_valid_f1={best_f1:.4f}, "
                 f"test_auc={test_auc:.4f}, "
-                f"test_acc={test_acc:.4f}\n"
+                f"test_acc={test_acc:.4f}, "
+                f"test_f1={test_f1:.4f}\n"
             )
 
         avg_auc /= num_runs
         avg_acc /= num_runs
+        avg_f1 /= num_runs
 
         print("====================================================================")
         print(f"FINAL AVERAGE over {num_runs} runs - dataset: {dataset}")
-        print(f"final_avg_acc: {avg_acc:.4f}, final_avg_auc: {avg_auc:.4f}")
+        print(f"final_avg_acc: {avg_acc:.4f}, final_avg_auc: {avg_auc:.4f}, final_avg_f1: {avg_f1:.4f}")
         print("====================================================================")
 
         file.write(
             f"FINAL AVERAGE over {num_runs} runs: "
-            f"acc={avg_acc:.4f}, auc={avg_auc:.4f}\n"
+            f"acc={avg_acc:.4f}, auc={avg_auc:.4f}, f1={avg_f1:.4f}\n"
         )

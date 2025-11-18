@@ -22,6 +22,9 @@ from utils import build_dense_graph
 # The core model code in models.py and loss code in metrics.py are unchanged.
 
 
+TOTAL_Q_SLOTS = 305  # maximum question attempt slots in the assessment bank
+
+
 class KTDataset(Dataset):
     """
     Simple container for per-student sequences.
@@ -32,14 +35,24 @@ class KTDataset(Dataset):
         answers[t]   = 0/1 correctness at time t
     """
 
-    def __init__(self, features, questions, answers):
+    def __init__(self, features, questions, answers, user_ids, completion_rates):
         assert len(features) == len(questions) == len(answers)
+        assert len(user_ids) == len(features)
+        assert len(completion_rates) == len(features)
         self.features = features
         self.questions = questions
         self.answers = answers
+        self.user_ids = user_ids
+        self.completion_rates = completion_rates
 
     def __getitem__(self, index):
-        return self.features[index], self.questions[index], self.answers[index]
+        return (
+            self.features[index],
+            self.questions[index],
+            self.answers[index],
+            self.user_ids[index],
+            self.completion_rates[index],
+        )
 
     def __len__(self):
         return len(self.features)
@@ -53,7 +66,7 @@ def pad_collate(batch):
       - models.GKT, which uses qt == -1 as padding mask,
       - metrics.KTLoss, which ignores real_answers == -1.
     """
-    features, questions, answers = zip(*batch)
+    features, questions, answers, user_ids, completion_rates = zip(*batch)
 
     features = [torch.LongTensor(feat) for feat in features]
     questions = [torch.LongTensor(qt) for qt in questions]
@@ -63,7 +76,10 @@ def pad_collate(batch):
     question_pad = pad_sequence(questions, batch_first=True, padding_value=-1)
     answer_pad = pad_sequence(answers, batch_first=True, padding_value=-1)
 
-    return feature_pad, question_pad, answer_pad
+    # user_ids: keep as a list (no padding)
+    # completion_rates: convert to numpy array for easy indexing
+    comp_rates = np.array(completion_rates, dtype=float)
+    return feature_pad, question_pad, answer_pad, list(user_ids), comp_rates
 
 
 def load_dataset(
@@ -160,13 +176,19 @@ def load_dataset(
     question_list = []
     answer_list = []
     seq_len_list = []
+    user_ids_list = []
+    completion_rates = []
 
     def collect_user(series: pd.DataFrame):
         feature_list.append(series["skill_with_answer"].tolist())
         question_list.append(series["skill"].tolist())
         # Convert correctness back to 0/1 for training
         answer_list.append(series["correct"].astype(int).tolist())
-        seq_len_list.append(series["correct"].shape[0])
+        L = int(series["correct"].shape[0])
+        seq_len_list.append(L)
+        uid = series["user_id"].iloc[0]
+        user_ids_list.append(uid)
+        completion_rates.append(float(L) / float(TOTAL_Q_SLOTS) if TOTAL_Q_SLOTS > 0 else 0.0)
 
     df.groupby("user_id").apply(collect_user)
 
@@ -180,7 +202,7 @@ def load_dataset(
     print(f"question_dim: {question_dim}")
 
     # Build dataset of all students
-    kt_dataset = KTDataset(feature_list, question_list, answer_list)
+    kt_dataset = KTDataset(feature_list, question_list, answer_list, user_ids_list, completion_rates)
 
     # Train/val/test split by student index
     train_size = int(student_num * train_ratio)

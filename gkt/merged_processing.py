@@ -89,6 +89,9 @@ class MergedGKTProcessor:
 
         groups = self._detect_qgroups(df)
         q_indices = sorted(groups.keys())
+        if q_indices:
+            print(f"Detecting question indices from qN_* columns ...")
+            print(f"Found {len(q_indices)} question slots: from q{q_indices[0]} to q{q_indices[-1]}")
 
         rows = []
         for _, row in df.iterrows():
@@ -127,6 +130,11 @@ class MergedGKTProcessor:
                     })
 
         out_df = pd.DataFrame(rows)
+
+        # Report unique questions for embedding vocabulary size
+        if not out_df.empty:
+            unique_q = out_df["skill_id"].nunique()
+            print(f"Number of unique questions: {unique_q}")
         print("Saving to", self.output_csv)
         out_df.to_csv(self.output_csv, index=False)
         print("Done. Total rows:", len(out_df))

@@ -18,11 +18,14 @@
 #   * Loads DKT-ready pickles (train/valid/test) and metadata.
 #   * Wraps them in Dataset/DataLoader via dkt_dataset.py.
 #   * Trains your DKT model (from dkt.py) with BCE loss.
-#   * Reports AUC and ACC for valid/test.
+#   * Reports AUC, ACC, and F1 for valid/test.
 #   * Computes fairness metrics on completion-rate bins during eval only:
+#       - Uses STABLE precomputed completion rates (not batch-dependent)
+#       - Bins students by engagement level (0-10%, 10-20%, ..., 90-100%)
 #       - Per-bin TPR/FPR/ACC
 #       - Equalized odds distance (lowest vs highest non-empty bin)
 #       - Accuracy variance across bins
+#       - Same student ALWAYS maps to same bin regardless of batch
 
 import argparse
 import json
@@ -33,7 +36,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score
 from torch.utils.data import DataLoader
 
 from dkt import DKT
@@ -110,11 +113,33 @@ def compute_overall_metrics(all_logits: List[float], all_labels: List[int]) -> D
         auc = float("nan")
     metrics["auc"] = float(auc)
 
+    # F1 Score (guard against degenerate all-0 or all-1 labels)
+    if y_true.size > 0 and np.unique(y_true).size == 2:
+        try:
+            f1 = f1_score(y_true, y_hat)
+        except Exception:
+            f1 = float("nan")
+    else:
+        f1 = float("nan")
+    metrics["f1"] = float(f1)
+
     return metrics
 
 
 def bin_index_from_completion_rate(cr: float, num_bins: int = 10) -> int:
-    """Map completion rate in [0,1] to bin index [0, num_bins-1]."""
+    """Map completion rate in [0,1] to bin index [0, num_bins-1].
+    
+    IMPORTANT: cr is a STABLE student property from preprocessing:
+        cr = (student's total questions) / TOTAL_Q_SLOTS
+    This ensures the same student always maps to the same bin.
+    
+    Args:
+        cr: Precomputed completion rate from preprocessing (stable per student)
+        num_bins: Number of engagement bins (default 10 for deciles)
+    
+    Returns:
+        Bin index in [0, num_bins-1] representing engagement group
+    """
     if cr < 0.0:
         cr = 0.0
     if cr > 1.0:
@@ -159,11 +184,15 @@ def compute_fairness_metrics(
         fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
         acc = (tp + tn) / total if total > 0 else np.nan
 
+        # Count unique students in this bin
+        num_students = len(bin_stats[b].get("users", set()))
+        
         per_bin[b] = {
             "tpr": float(tpr),
             "fpr": float(fpr),
             "acc": float(acc),
-            "count": int(total),
+            "count": int(total),  # Total predictions
+            "num_students": num_students,  # Unique students
         }
 
     # Print bin-level stats
@@ -174,7 +203,7 @@ def compute_fairness_metrics(
         hi = 10 * (b + 1)
         print(
             f"    Bin {b} ({lo:2d}-{hi:3d}%): "
-            f"count={info['count']}, "
+            f"students={info['num_students']}, predictions={info['count']}, "
             f"TPR={info['tpr']:.3f}, FPR={info['fpr']:.3f}, ACC={info['acc']:.3f}"
         )
 
@@ -241,8 +270,8 @@ def run_epoch(
     all_logits: List[float] = []
     all_labels: List[int] = []
 
-    # For fairness: bin -> {preds: [...], labels: [...]}
-    bin_stats: Dict[int, Dict[str, List[float]]] = {}
+    # For fairness: bin -> {preds: [...], labels: [...], users: set()}
+    bin_stats: Dict[int, Dict] = {}
 
     for batch in loader:
         q, r, mask, users, completion_rates = batch
@@ -298,13 +327,18 @@ def run_epoch(
         all_logits.extend(y_flat.detach().cpu().numpy().tolist())
         all_labels.extend(r_flat.detach().cpu().numpy().astype(int).tolist())
 
-        # Collect bin-level stats for fairness (eval only; but we'll just
-        # compute them and ignore when train=True)
+        # Collect bin-level stats for fairness using STABLE completion rates
+        # CRITICAL: completion_rates[i] is PRECOMPUTED in preprocessing
+        # Formula: cr = (student_questions / TOTAL_Q_SLOTS)
+        # This ensures same student -> same bin across ALL batches
         for i in range(B):
-            cr = float(completion_rates[i])
+            cr = float(completion_rates[i])  # Stable precomputed rate
             b = bin_index_from_completion_rate(cr, num_bins=10)
             if b not in bin_stats:
-                bin_stats[b] = {"preds": [], "labels": []}
+                bin_stats[b] = {"preds": [], "labels": [], "users": set()}
+
+            # Track unique user in this bin
+            bin_stats[b]["users"].add(users[i])
 
             # Valid positions for this user in this batch
             m_i = m_next[i] > 0.0
@@ -414,7 +448,7 @@ def main():
         )
         print(
             f"  [Train] loss={train_loss:.4f}, "
-            f"AUC={train_metrics['auc']:.4f}, ACC={train_metrics['acc']:.4f}"
+            f"AUC={train_metrics['auc']:.4f}, ACC={train_metrics['acc']:.4f}, F1={train_metrics['f1']:.4f}"
         )
 
         # Validation
@@ -424,7 +458,7 @@ def main():
             )
         print(
             f"  [Valid] loss={valid_loss:.4f}, "
-            f"AUC={valid_metrics['auc']:.4f}, ACC={valid_metrics['acc']:.4f}"
+            f"AUC={valid_metrics['auc']:.4f}, ACC={valid_metrics['acc']:.4f}, F1={valid_metrics['f1']:.4f}"
         )
         print(
             f"          EO(low-high)={valid_fairness.get('eo_low_high', float('nan')):.4f}, "
@@ -461,7 +495,7 @@ def main():
     print("===== FINAL TEST RESULTS =====")
     print(
         f"[Test] loss={test_loss:.4f}, "
-        f"AUC={test_metrics['auc']:.4f}, ACC={test_metrics['acc']:.4f}"
+        f"AUC={test_metrics['auc']:.4f}, ACC={test_metrics['acc']:.4f}, F1={test_metrics['f1']:.4f}"
     )
     print(
         f"       EO(low-high)={test_fairness.get('eo_low_high', float('nan')):.4f}, "

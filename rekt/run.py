@@ -1,5 +1,6 @@
 
 from sklearn import metrics
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -21,7 +22,7 @@ def _compute_bin_stats(bin_labels, bin_outputs):
     Returns
     -------
     dict
-        Mapping bin_index -> dict(tpr=..., fpr=..., acc=...),
+        Mapping bin_index -> dict(tpr=..., fpr=..., acc=..., count=...),
         only for bins that have at least one example.
     """
     stats = {}
@@ -47,7 +48,7 @@ def _compute_bin_stats(bin_labels, bin_outputs):
         denom = tp + tn + fp + fn
         acc = float(tp + tn) / denom if denom > 0 else float("nan")
 
-        stats[b] = {"tpr": tpr, "fpr": fpr, "acc": acc}
+        stats[b] = {"tpr": tpr, "fpr": fpr, "acc": acc, "count": y_true.size}
 
     return stats
 
@@ -133,7 +134,7 @@ def run_epoch(
       * accuracy variance across all non-empty bins
 
     Fairness statistics are *only* logged during evaluation. The return
-    value remains (avg_loss, acc, auc) for compatibility.
+    value is (avg_loss, acc, auc, f1).
     """  # noqa: E501
     loader = getLoader(
         max_problem, pro_path, skill_path, batch_size, is_train, min_problem_num, max_problem_num
@@ -154,12 +155,11 @@ def run_epoch(
     # For fairness metrics (evaluation only)
     if not is_train:
         # 10 completion bins: 0..9
-        bin_labels = [[] for _ in range(10)]
-        bin_outputs = [[] for _ in range(10)]
+        bin_stats = [{"labels": [], "outputs": [], "users": set()} for _ in range(10)]
 
     for batch in tqdm(loader):
-        # Unpack batch
-        last_problem, last_skill, last_ans, next_problem, next_skill, next_ans, mask = batch
+        # Unpack batch (now includes completion_rate and user_id per sample)
+        last_problem, last_skill, last_ans, next_problem, next_skill, next_ans, mask, completion_rate, user_id = batch
 
         # Everything should already be on device from load_data, but this is safe
         last_problem = last_problem.to(device)
@@ -213,34 +213,30 @@ def run_epoch(
         # Fairness bookkeeping: per-student completion bins (eval only)
         if not is_train:
             # mask/next_predict/next_ans have shape [B, L]
-            batch_size_cur, seq_len = next_ans.shape
+            batch_size_cur = next_ans.shape[0]
 
-            # Sequence length L per student = number of valid steps
-            seq_lens = mask.sum(dim=1).detach().cpu().numpy().astype(float)
-            # Q = maximum possible length from mask (time dimension)
-            Q = float(seq_len)
-
-            # For each student in batch, assign all of their valid steps
-            # to a completion bin based on L / Q.
+            # For each sample in batch, assign all valid steps to a bin
+            # based on precomputed completion rate
             for i in range(batch_size_cur):
-                L = seq_lens[i]
-                if Q <= 0:
-                    continue
-                completion_rate = L / Q  # in [0, 1]
-
+                # completion_rate is already calculated as: student's total questions / 305
+                cr = float(completion_rate[i].item() if torch.is_tensor(completion_rate[i]) else completion_rate[i])
+                uid = int(user_id[i].item() if torch.is_tensor(user_id[i]) else user_id[i])
+                
                 # Map completion_rate in [0,1] to bins 0..9
-                if completion_rate >= 1.0:
+                if cr >= 1.0:
                     bin_idx = 9
-                elif completion_rate <= 0.0:
+                elif cr <= 0.0:
                     bin_idx = 0
                 else:
-                    bin_idx = int(completion_rate * 10.0)
-
-                if bin_idx < 0:
-                    bin_idx = 0
-                if bin_idx > 9:
-                    bin_idx = 9
-
+                    bin_idx = int(cr * 10.0)
+                
+                # Clamp to valid range
+                bin_idx = max(0, min(9, bin_idx))
+                
+                # Track unique user in this bin
+                bin_stats[bin_idx]["users"].add(uid)
+                
+                # Get valid positions for this sample
                 m_i = mask[i].bool()
                 if m_i.sum() == 0:
                     continue
@@ -248,8 +244,8 @@ def run_epoch(
                 student_labels = next_ans[i][m_i].detach().cpu().numpy().astype(int)
                 student_outputs = next_predict[i][m_i].detach().cpu().numpy().astype(float)
 
-                bin_labels[bin_idx].extend(student_labels.tolist())
-                bin_outputs[bin_idx].extend(student_outputs.tolist())
+                bin_stats[bin_idx]["labels"].extend(student_labels.tolist())
+                bin_stats[bin_idx]["outputs"].extend(student_outputs.tolist())
 
     avg_loss = float(np.average(total_loss)) if total_loss else float("nan")
     acc = float(total_correct) / float(total_num) if total_num > 0 else float("nan")
@@ -259,26 +255,67 @@ def run_epoch(
         auc = metrics.roc_auc_score(labels, outputs)
     except ValueError:
         auc = float("nan")
+    
+    # Calculate F1 score
+    try:
+        preds = (np.array(outputs) >= 0.5).astype(int)
+        f1 = f1_score(labels, preds)
+    except (ValueError, ZeroDivisionError):
+        f1 = float("nan")
 
     # Fairness metrics (evaluation only)
     if not is_train:
-        bin_stats = _compute_bin_stats(bin_labels, bin_outputs)
-        fairness = _compute_fairness_from_bins(bin_stats)
+        # Compute metrics from collected bin statistics
+        computed_bin_stats = {}
+        for b in range(10):
+            y_true = np.asarray(bin_stats[b]["labels"], dtype=int)
+            y_score = np.asarray(bin_stats[b]["outputs"], dtype=float)
+            num_students = len(bin_stats[b]["users"])
+            
+            if y_true.size == 0:
+                continue
+                
+            y_pred = (y_score >= 0.5).astype(int)
+            
+            pos_mask = y_true == 1
+            neg_mask = y_true == 0
+            
+            tp = int((y_pred[pos_mask] == 1).sum()) if pos_mask.any() else 0
+            fn = int((y_pred[pos_mask] == 0).sum()) if pos_mask.any() else 0
+            fp = int((y_pred[neg_mask] == 1).sum()) if neg_mask.any() else 0
+            tn = int((y_pred[neg_mask] == 0).sum()) if neg_mask.any() else 0
+            
+            tpr = float(tp) / (tp + fn) if (tp + fn) > 0 else float("nan")
+            fpr = float(fp) / (fp + tn) if (fp + tn) > 0 else float("nan")
+            denom = tp + tn + fp + fn
+            acc = float(tp + tn) / denom if denom > 0 else float("nan")
+            
+            computed_bin_stats[b] = {
+                "tpr": tpr,
+                "fpr": fpr,
+                "acc": acc,
+                "students": num_students,
+                "predictions": y_true.size
+            }
+        
+        fairness = _compute_fairness_from_bins(computed_bin_stats)
 
         # Pretty-print fairness summary
-        print("=== Fairness (by completion bins) ===")
-        print("Non-empty bins:", sorted(bin_stats.keys()))
-        for b in sorted(bin_stats.keys()):
-            st = bin_stats[b]
+        print("Fairness per completion-rate bin:")
+        for b in sorted(computed_bin_stats.keys()):
+            st = computed_bin_stats[b]
             print(
-                f"  Bin {b} (completion {b*10:02d}-{(b+1)*10:02d}%): "
-                f"TPR={st['tpr']:.4f} FPR={st['fpr']:.4f} ACC={st['acc']:.4f}"
+                f"  Bin {b} ({b*10:2d}-{(b+1)*10:3d}%): "
+                f"students={st['students']}, "
+                f"predictions={st['predictions']}, "
+                f"TPR={st['tpr']:.3f}, "
+                f"FPR={st['fpr']:.3f}, "
+                f"ACC={st['acc']:.3f}"
             )
         print(
-            f"EO dist (lowest vs highest non-empty bin): "
+            f"Equalized odds distance (lowest vs highest non-empty bin): "
             f"{fairness['eo_dist_low_high']:.4f}"
         )
         print(f"Accuracy variance across bins: {fairness['acc_var']:.6f}")
-        print("=====================================")
 
-    return avg_loss, acc, auc
+    return avg_loss, acc, auc, f1

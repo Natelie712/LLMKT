@@ -2,6 +2,9 @@ import torch
 import torch.utils.data as data
 import numpy as np
 
+# Total questions available across all courses in the curriculum
+TOTAL_Q_SLOTS = 305
+
 
 class getReader:
     """
@@ -82,14 +85,20 @@ class KT_Dataset(data.Dataset):
         self.problem_list = []
         self.ans_list = []
         self.skill_list = []
+        self.completion_rates = []  # Track completion rate for each chunk
+        self.user_ids = []  # Track user ID for each chunk
 
-        for problem, ans, skill in zip(problem_list, ans_list, skill_list):
+        for user_id, (problem, ans, skill) in enumerate(zip(problem_list, ans_list, skill_list)):
             assert len(problem) == len(ans) == len(skill)
             num = len(problem)
 
             # drop too-short sequences
             if num < self.min_problem_num:
                 continue
+
+            # Calculate completion rate for this student (before chunking)
+            # num = total questions this student answered
+            completion_rate = num / float(TOTAL_Q_SLOTS)
 
             # split long sequences into chunks of max_problem_num
             start = 0
@@ -104,6 +113,9 @@ class KT_Dataset(data.Dataset):
                     self.problem_list.append(sub_problem)
                     self.ans_list.append(sub_ans)
                     self.skill_list.append(sub_skill)
+                    # All chunks from same student get same completion rate and user_id
+                    self.completion_rates.append(completion_rate)
+                    self.user_ids.append(user_id)
 
                 start = end
 
@@ -163,8 +175,12 @@ class KT_Dataset(data.Dataset):
         next_skill = torch.from_numpy(next_skill).to(device).long()
 
         mask_tensor = torch.tensor(mask == 1).to(device)
+        
+        # Get completion rate and user_id for this sequence
+        completion_rate = self.completion_rates[index]
+        user_id = self.user_ids[index]
 
-        return last_problem, last_skill, last_ans, next_problem, next_skill, next_ans, mask_tensor
+        return last_problem, last_skill, last_ans, next_problem, next_skill, next_ans, mask_tensor, completion_rate, user_id
 
 
 def getLoader(problem_max, pro_path, skill_path, batch_size,
