@@ -300,7 +300,7 @@ def run_epoch(
         
         fairness = _compute_fairness_from_bins(computed_bin_stats)
 
-        # Pretty-print fairness summary
+        # Pretty-print fairness summary to match prompt wording
         print("Fairness per completion-rate bin:")
         for b in sorted(computed_bin_stats.keys()):
             st = computed_bin_stats[b]
@@ -313,8 +313,7 @@ def run_epoch(
                 f"ACC={st['acc']:.3f}"
             )
         print(
-            f"Equalized odds distance (lowest vs highest non-empty bin): "
-            f"{fairness['eo_dist_low_high']:.4f}"
+            f"Equalized odds distance: {fairness['eo_dist_low_high']:.4f}"
         )
         print(f"Accuracy variance across bins: {fairness['acc_var']:.6f}")
 

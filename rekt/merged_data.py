@@ -36,9 +36,8 @@ class MergedDataProcess:
         - Concept/skill id = question id (1-to-1 mapping)
         - Correctness priority per attempt:
 
-            1) qN_answerchoiceselected_iscorrect
-            2) qN_correctresponse
-            3) qN_correct
+            1) qN_correct
+            2) qN_answerchoiceselected_iscorrect
 
           Any value that can be interpreted as 0/1 is accepted:
           0/1, '0'/'1', True/False, 'True'/'False', etc.
@@ -215,12 +214,11 @@ class MergedDataProcess:
                 if raw_qid is None:
                     continue
 
-                # correctness priority: answerchoiceselected_iscorrect > correctresponse > correct
+                # correctness priority: correct > answerchoiceselected_iscorrect
                 corr_val = None
                 corr_suffix_order = [
-                    "answerchoiceselected_iscorrect",
-                    "correctresponse",
                     "correct",
+                    "answerchoiceselected_iscorrect",
                 ]
                 for suffix in corr_suffix_order:
                     colname = info["corr_cols"].get(suffix)
@@ -267,20 +265,28 @@ class MergedDataProcess:
 
         return qid2idx, skill2idx
 
-    def _train_test_split(self, user_ids, train_user_ratio=None):
-        if train_user_ratio is None:
-            train_user_ratio = self.train_user_ratio
+    def _train_valid_test_split(self, user_ids, train_ratio=0.8, valid_ratio=0.1):
+        """Split user indices into train/valid/test by user.
 
+        Ensures disjoint sets and uses the class random_state for reproducibility.
+        """
         rng = np.random.RandomState(self.random_state)
         n_users = len(user_ids)
         indices = np.arange(n_users)
         rng.shuffle(indices)
 
-        n_train = int(n_users * train_user_ratio)
-        train_idx = indices[:n_train]
-        test_idx = indices[n_train:]
+        n_train = int(n_users * train_ratio)
+        n_valid = int(n_users * valid_ratio)
+        n_test = n_users - n_train - n_valid
 
-        return train_idx, test_idx
+        train_idx = indices[:n_train]
+        valid_idx = indices[n_train:n_train + n_valid]
+        test_idx = indices[n_train + n_valid:]
+
+        # Safety clamp in case of small datasets
+        if n_test < 0:
+            test_idx = np.array([], dtype=int)
+        return train_idx, valid_idx, test_idx
 
     # ------------------------------------------------------------------
     # Public API
@@ -322,8 +328,8 @@ class MergedDataProcess:
         encoded_q_seqs = [[qid2idx[q] for q in qs] for qs in ques_seqs]
         encoded_s_seqs = [[skill2idx[q] for q in qs] for qs in ques_seqs]
 
-        # Train / test split at user level
-        train_idx, test_idx = self._train_test_split(user_ids)
+        # Train / valid / test split at user level (80/10/10)
+        train_idx, valid_idx, test_idx = self._train_valid_test_split(user_ids, 0.8, 0.1)
 
         def _subset(indices):
             seq_lens = []
@@ -347,23 +353,30 @@ class MergedDataProcess:
             return seq_lens, qs_list, skills_list, ans_list
 
         train_seq_lens, train_qs, train_skills, train_ans = _subset(train_idx)
+        valid_seq_lens, valid_qs, valid_skills, valid_ans = _subset(valid_idx)
         test_seq_lens, test_qs, test_skills, test_ans = _subset(test_idx)
 
         # Write ReKT text files
         train_question_path = os.path.join(self.save_folder, "train_question.txt")
+        valid_question_path = os.path.join(self.save_folder, "valid_question.txt")
         test_question_path = os.path.join(self.save_folder, "test_question.txt")
         train_skill_path = os.path.join(self.save_folder, "train_skill.txt")
+        valid_skill_path = os.path.join(self.save_folder, "valid_skill.txt")
         test_skill_path = os.path.join(self.save_folder, "test_skill.txt")
 
         write_lists(train_seq_lens, train_qs, train_ans, train_question_path)
+        write_lists(valid_seq_lens, valid_qs, valid_ans, valid_question_path)
         write_lists(test_seq_lens, test_qs, test_ans, test_question_path)
         write_lists(train_seq_lens, train_skills, train_ans, train_skill_path)
+        write_lists(valid_seq_lens, valid_skills, valid_ans, valid_skill_path)
         write_lists(test_seq_lens, test_skills, test_ans, test_skill_path)
 
         print("Wrote:")
         print("  ", train_question_path)
+        print("  ", valid_question_path)
         print("  ", test_question_path)
         print("  ", train_skill_path)
+        print("  ", valid_skill_path)
         print("  ", test_skill_path)
 
         # ques_skill.csv: question_idx, skill_idx (1-to-1 mapping)

@@ -253,9 +253,8 @@ def main():
 
     # Define correctness priority for each qN_*
     correctness_priority = [
-        "answerchoiceselected_iscorrect",
-        "correctresponse",
         "correct",
+        "answerchoiceselected_iscorrect",
     ]
 
     all_user_ids: List[str] = []

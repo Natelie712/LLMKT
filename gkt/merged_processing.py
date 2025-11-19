@@ -110,7 +110,7 @@ class MergedGKTProcessor:
 
                 # correctness priority
                 corr = None
-                for suf in ["answerchoiceselected_iscorrect", "correctresponse", "correct"]:
+                for suf in ["correct", "answerchoiceselected_iscorrect"]:
                     if suf in g:
                         corr = self._to_binary(row[g[suf]])
                         if corr is not None:
