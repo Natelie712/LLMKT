@@ -61,13 +61,13 @@ def parse_args():
                         help="Directory with dkt_train/valid/test.pkl and metadata.")
     parser.add_argument("--max_len", type=int, default=300,
                         help="Max sequence length (pad/truncate).")
-    parser.add_argument("--hidden", type=int, default=200,
+    parser.add_argument("--hidden", type=int, default=64,
                         help="Embedding/hidden size for DKT.")
-    parser.add_argument("--dropout", type=float, default=0.1,
+    parser.add_argument("--dropout", type=float, default=0.2,
                         help="Dropout rate.")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size.")
-    parser.add_argument("--epochs", type=int, default=30,
+    parser.add_argument("--epochs", type=int, default=50,
                         help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate.")

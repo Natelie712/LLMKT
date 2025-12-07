@@ -329,7 +329,41 @@ class MergedDataProcess:
         encoded_s_seqs = [[skill2idx[q] for q in qs] for qs in ques_seqs]
 
         # Train / valid / test split at user level (80/10/10)
-        train_idx, valid_idx, test_idx = self._train_valid_test_split(user_ids, 0.8, 0.1)
+        # Check for unified splits first
+        # Robustly find data/splits.json relative to this script
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        splits_path = os.path.join(base_dir, "..", "data", "splits.json")
+
+        if os.path.exists(splits_path):
+            print(f"Loading unified splits from {splits_path} ...")
+            import json
+            with open(splits_path, "r") as f:
+                splits = json.load(f)
+            
+            train_set = set(splits["train"])
+            valid_set = set(splits["valid"])
+            test_set = set(splits["test"])
+            
+            train_idx = []
+            valid_idx = []
+            test_idx = []
+            
+            for i, uid in enumerate(user_ids):
+                uid_str = str(uid)
+                if uid_str in train_set:
+                    train_idx.append(i)
+                elif uid_str in valid_set:
+                    valid_idx.append(i)
+                elif uid_str in test_set:
+                    test_idx.append(i)
+            
+            train_idx = np.array(train_idx)
+            valid_idx = np.array(valid_idx)
+            test_idx = np.array(test_idx)
+            print(f"Applied unified split: Train={len(train_idx)}, Valid={len(valid_idx)}, Test={len(test_idx)}")
+        else:
+            print("Unified splits not found. Using random split ...")
+            train_idx, valid_idx, test_idx = self._train_valid_test_split(user_ids, 0.8, 0.1)
 
         def _subset(indices):
             seq_lens = []

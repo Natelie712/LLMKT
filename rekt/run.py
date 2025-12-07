@@ -118,6 +118,7 @@ def run_epoch(
     criterion,
     device,
     grad_clip,
+    prefix="Validation",
 ):
     """Run one training or evaluation epoch.
 
@@ -301,7 +302,7 @@ def run_epoch(
         fairness = _compute_fairness_from_bins(computed_bin_stats)
 
         # Pretty-print fairness summary to match prompt wording
-        print("Fairness per completion-rate bin:")
+        print(f"{prefix} Fairness per completion-rate bin:")
         for b in sorted(computed_bin_stats.keys()):
             st = computed_bin_stats[b]
             print(

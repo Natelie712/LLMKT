@@ -312,14 +312,55 @@ def main():
         completion_rates.append(L / float(TOTAL_Q_SLOTS))
 
     # Train / valid / test split at user level
-    rng = np.random.default_rng(args.seed)
-    train_idx, valid_idx, test_idx = split_indices(
-        n=num_users,
-        train_ratio=args.train_ratio,
-        valid_ratio=args.valid_ratio,
-        test_ratio=args.test_ratio,
-        rng=rng,
-    )
+    # Check for unified splits first
+    # Robustly find data/splits.json relative to this script
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    splits_path = os.path.join(base_dir, "..", "data", "splits.json")
+    
+    if os.path.exists(splits_path):
+        print(f"Loading unified splits from {splits_path} ...")
+        with open(splits_path, "r") as f:
+            splits = json.load(f)
+        
+        # Create sets for O(1) lookup
+        train_set = set(splits["train"])
+        valid_set = set(splits["valid"])
+        test_set = set(splits["test"])
+        
+        train_idx = []
+        valid_idx = []
+        test_idx = []
+        
+        for i, uid in enumerate(all_user_ids):
+            # Ensure uid is string for comparison
+            uid_str = str(uid)
+            if uid_str in train_set:
+                train_idx.append(i)
+            elif uid_str in valid_set:
+                valid_idx.append(i)
+            elif uid_str in test_set:
+                test_idx.append(i)
+            else:
+                # Fallback or warning? 
+                # If user not in split (maybe filtered out in generation?), skip or assign?
+                # For safety, let's skip or warn.
+                pass
+                
+        train_idx = np.array(train_idx)
+        valid_idx = np.array(valid_idx)
+        test_idx = np.array(test_idx)
+        print(f"Applied unified split: Train={len(train_idx)}, Valid={len(valid_idx)}, Test={len(test_idx)}")
+        
+    else:
+        print("Unified splits not found. Using random split with seed ...")
+        rng = np.random.default_rng(args.seed)
+        train_idx, valid_idx, test_idx = split_indices(
+            n=num_users,
+            train_ratio=args.train_ratio,
+            valid_ratio=args.valid_ratio,
+            test_ratio=args.test_ratio,
+            rng=rng,
+        )
 
     def subset(indices: np.ndarray):
         return (

@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import pandas as pd
 import torch
@@ -11,8 +12,10 @@ mp2path = {
     "merged": {
         "ques_skill_path": "data/MERGED/ques_skill.csv",
         "train_path": "data/MERGED/train_question.txt",
+        "valid_path": "data/MERGED/valid_question.txt",
         "test_path": "data/MERGED/test_question.txt",
         "train_skill_path": "data/MERGED/train_skill.txt",
+        "valid_skill_path": "data/MERGED/valid_skill.txt",
         "test_skill_path": "data/MERGED/test_skill.txt",
         # No fixed skill_max here; we infer it from ques_skill.csv
     }
@@ -43,8 +46,20 @@ def get_problem_and_skill_max(ques_skill_path: str):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train ReKT model")
+    parser.add_argument("--dataset", type=str, default="merged", help="Dataset name")
+    parser.add_argument("--hidden", type=int, default=64, help="Hidden dimension (d)")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (p)")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--num_runs", type=int, default=1, help="Number of runs with different seeds")
+    parser.add_argument("--seed", type=int, default=42, help="Base seed (if num_runs=1)")
+    
+    args = parser.parse_args()
+
     # You can change this to run other datasets if you extend mp2path
-    dataset = "merged"
+    dataset = args.dataset
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -53,20 +68,22 @@ if __name__ == "__main__":
 
     ques_skill_path = paths["ques_skill_path"]
     train_path = paths["train_path"]
+    valid_path = paths["valid_path"]
     test_path = paths["test_path"]
     train_skill_path = paths["train_skill_path"]
+    valid_skill_path = paths["valid_skill_path"]
     test_skill_path = paths["test_skill_path"]
 
     # Infer pro_max and skill_max from ques_skill.csv
     pro_max, skill_max = get_problem_and_skill_max(ques_skill_path)
     print(f"[{dataset}] pro_max = {pro_max}, skill_max = {skill_max}")
 
-    # Hyperparameters (kept close to original ReKT defaults)
-    p = 0.4
-    d = 128
-    learning_rate = 0.002
-    epochs = 70
-    batch_size = 80
+    # Hyperparameters
+    p = args.dropout
+    d = args.hidden
+    learning_rate = args.lr
+    epochs = args.epochs
+    batch_size = args.batch_size
     min_seq = 3
     max_seq = 200
     grad_clip = 15.0
@@ -76,8 +93,8 @@ if __name__ == "__main__":
     avg_acc = 0.0
     avg_f1 = 0.0
 
-    # For reproducibility / robustness, do 5 runs with different seeds
-    num_runs = 5
+    # For reproducibility / robustness, do num_runs with different seeds
+    num_runs = args.num_runs
 
     with open(f"{dataset}_output.txt", "w") as file:
         for run_id in range(num_runs):
@@ -85,8 +102,10 @@ if __name__ == "__main__":
             print(f"Run {run_id + 1}/{num_runs} for dataset = {dataset}")
             print("====================================================================")
 
-            torch.manual_seed(run_id)
-            np.random.seed(run_id)
+            # Use args.seed if num_runs is 1, else use run_id
+            current_seed = args.seed if num_runs == 1 else run_id
+            torch.manual_seed(current_seed)
+            np.random.seed(current_seed)
 
             best_acc = 0.0
             best_auc = 0.0
@@ -132,8 +151,8 @@ if __name__ == "__main__":
                 # valid_path/valid_skill_path there instead.
                 valid_loss, valid_acc, valid_auc, valid_f1 = run_epoch(
                     pro_max,
-                    test_path,
-                    test_skill_path,
+                    valid_path,
+                    valid_skill_path,
                     batch_size,
                     False,
                     min_seq,
@@ -143,6 +162,7 @@ if __name__ == "__main__":
                     criterion,
                     device,
                     grad_clip,
+                    prefix="Validation",
                 )
                 print(
                     f"epoch: {epoch:03d}, "
@@ -188,6 +208,7 @@ if __name__ == "__main__":
                 criterion,
                 device,
                 grad_clip,
+                prefix="Test",
             )
 
             print("************************************************************************")

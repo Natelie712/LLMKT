@@ -205,14 +205,48 @@ def load_dataset(
     kt_dataset = KTDataset(feature_list, question_list, answer_list, user_ids_list, completion_rates)
 
     # Train/val/test split by student index
-    train_size = int(student_num * train_ratio)
-    val_size = int(student_num * val_ratio)
-    test_size = student_num - train_size - val_size
-    print(f"train_size: {train_size}  val_size: {val_size}  test_size: {test_size}")
+    # Robustly find data/splits.json relative to this script
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    splits_path = os.path.join(base_dir, "..", "data", "splits.json")
 
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        kt_dataset, [train_size, val_size, test_size]
-    )
+    if os.path.exists(splits_path):
+        print(f"Loading unified splits from {splits_path} ...")
+        import json
+        with open(splits_path, "r") as f:
+            splits = json.load(f)
+        
+        train_set = set(splits["train"])
+        valid_set = set(splits["valid"])
+        test_set = set(splits["test"])
+        
+        train_indices = []
+        val_indices = []
+        test_indices = []
+        
+        for i, uid in enumerate(user_ids_list):
+            uid_str = str(uid)
+            if uid_str in train_set:
+                train_indices.append(i)
+            elif uid_str in valid_set:
+                val_indices.append(i)
+            elif uid_str in test_set:
+                test_indices.append(i)
+        
+        print(f"Applied unified split: Train={len(train_indices)}, Valid={len(val_indices)}, Test={len(test_indices)}")
+        
+        train_dataset = torch.utils.data.Subset(kt_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(kt_dataset, val_indices)
+        test_dataset = torch.utils.data.Subset(kt_dataset, test_indices)
+    else:
+        print("Unified splits not found. Using random split ...")
+        train_size = int(student_num * train_ratio)
+        val_size = int(student_num * val_ratio)
+        test_size = student_num - train_size - val_size
+        print(f"train_size: {train_size}  val_size: {val_size}  test_size: {test_size}")
+
+        train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+            kt_dataset, [train_size, val_size, test_size]
+        )
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=pad_collate

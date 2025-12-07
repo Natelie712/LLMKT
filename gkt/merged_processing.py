@@ -4,6 +4,8 @@ import re
 import numpy as np
 import pandas as pd
 
+import argparse
+
 class MergedGKTProcessor:
     """
     Convert wide merged dataset (qN_id, qN_answerchoiceselected_iscorrect, etc.)
@@ -23,7 +25,9 @@ class MergedGKTProcessor:
         self.source_csv = source_csv
         self.output_csv = output_csv
         self.min_seq_len = min_seq_len
-        os.makedirs("data", exist_ok=True)
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(self.output_csv)), exist_ok=True)
 
     @staticmethod
     def _clean_id(val):
@@ -141,5 +145,15 @@ class MergedGKTProcessor:
 
 
 if __name__ == "__main__":
-    proc = MergedGKTProcessor()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default="merged_student_question_history.csv", help="Path to input wide CSV")
+    parser.add_argument("--output", default="data/merged_gkt.csv", help="Path to output long CSV")
+    parser.add_argument("--min_seq_len", type=int, default=3, help="Minimum sequence length")
+    args = parser.parse_args()
+
+    proc = MergedGKTProcessor(
+        source_csv=args.input,
+        output_csv=args.output,
+        min_seq_len=args.min_seq_len
+    )
     proc.process()

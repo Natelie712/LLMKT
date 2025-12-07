@@ -32,14 +32,14 @@ parser.add_argument('--load-dir', type=str, default='', help='Where to load the 
 parser.add_argument('--dkt-graph-dir', type=str, default='dkt-graph', help='Where to load the pretrained dkt graph.')
 parser.add_argument('--dkt-graph', type=str, default='dkt_graph.txt', help='DKT graph data file name.')
 parser.add_argument('--model', type=str, default='GKT', help='Model type to use, support GKT and DKT.')
-parser.add_argument('--hid-dim', type=int, default=32, help='Dimension of hidden knowledge states.')
-parser.add_argument('--emb-dim', type=int, default=32, help='Dimension of concept embedding.')
+parser.add_argument('--hid-dim', type=int, default=64, help='Dimension of hidden knowledge states.')
+parser.add_argument('--emb-dim', type=int, default=64, help='Dimension of concept embedding.')
 parser.add_argument('--attn-dim', type=int, default=32, help='Dimension of multi-head attention layers.')
 parser.add_argument('--vae-encoder-dim', type=int, default=32, help='Dimension of hidden layers in vae encoder.')
 parser.add_argument('--vae-decoder-dim', type=int, default=32, help='Dimension of hidden layers in vae decoder.')
 parser.add_argument('--edge-types', type=int, default=2, help='The number of edge types to infer.')
 parser.add_argument('--graph-type', type=str, default='Dense', help='The type of latent concept graph.')
-parser.add_argument('--dropout', type=float, default=0, help='Dropout rate (1 - keep probability).')
+parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate (1 - keep probability).')
 parser.add_argument('--bias', type=bool, default=True, help='Whether to add bias for neural network layers.')
 parser.add_argument('--binary', type=bool, default=True, help='Whether only use 0/1 for results.')
 parser.add_argument('--result-type', type=int, default=12, help='Number of results types when multiple results are used.')
@@ -49,9 +49,9 @@ parser.add_argument('--no-factor', action='store_true', default=False, help='Dis
 parser.add_argument('--prior', action='store_true', default=False, help='Whether to use sparsity prior.')
 parser.add_argument('--var', type=float, default=1, help='Output variance.')
 parser.add_argument('--epochs', type=int, default=50, help='Number of epochs to train.')
-parser.add_argument('--batch-size', type=int, default=128, help='Number of samples per batch.')
-parser.add_argument('--train-ratio', type=float, default=0.6, help='The ratio of training samples in a dataset.')
-parser.add_argument('--val-ratio', type=float, default=0.2, help='The ratio of validation samples in a dataset.')
+parser.add_argument('--batch-size', type=int, default=64, help='Number of samples per batch.')
+parser.add_argument('--train-ratio', type=float, default=0.8, help='The ratio of training samples in a dataset.')
+parser.add_argument('--val-ratio', type=float, default=0.1, help='The ratio of validation samples in a dataset.')
 parser.add_argument('--shuffle', type=bool, default=True, help='Whether to shuffle the dataset or not.')
 parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate.')
 parser.add_argument('--lr-decay', type=int, default=200, help='After how epochs to decay LR by a factor of gamma.')
@@ -59,7 +59,9 @@ parser.add_argument('--gamma', type=float, default=0.5, help='LR decay factor.')
 parser.add_argument('--test', type=bool, default=False, help='Whether to test for existed model.')
 parser.add_argument('--test-model-dir', type=str, default='logs/expDKT', help='Existed model file dir.')
 
-
+# Arguments for automatic DKT graph generation
+parser.add_argument('--dkt-model-path', type=str, default=None, help='Path to trained DKT model checkpoint (dkt_best.pt).')
+parser.add_argument('--dkt-mapping-path', type=str, default=None, help='Path to DKT question mapping (dkt_question_mapping.json).')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -107,13 +109,34 @@ else:
 # load dataset
 dataset_path = os.path.join(args.data_dir, args.data_file)
 dkt_graph_path = os.path.join(args.dkt_graph_dir, args.dkt_graph)
+
+# Automatic DKT Graph Generation
+if args.model == 'GKT' and args.graph_type == 'DKT':
+    if not os.path.exists(dkt_graph_path):
+        if args.dkt_model_path and args.dkt_mapping_path:
+            print(f"DKT graph not found at {dkt_graph_path}. Attempting to generate...")
+            try:
+                from dkt_generator import generate_and_save_dkt_graph
+                generate_and_save_dkt_graph(
+                    dkt_model_path=args.dkt_model_path,
+                    dkt_mapping_path=args.dkt_mapping_path,
+                    gkt_csv_path=dataset_path,
+                    output_path=dkt_graph_path,
+                    device_str='cuda' if args.cuda else 'cpu'
+                )
+            except ImportError as e:
+                print(f"Error importing dkt_generator: {e}")
+                print("Please ensure dkt_generator.py is in the gkt directory and dkt module is accessible.")
+            except Exception as e:
+                print(f"Error generating DKT graph: {e}")
+        else:
+            print(f"Warning: DKT graph missing at {dkt_graph_path} and --dkt-model-path/--dkt-mapping-path not provided.")
+
 if not os.path.exists(dkt_graph_path):
     dkt_graph_path = None
 concept_num, graph, train_loader, valid_loader, test_loader = load_dataset(dataset_path, args.batch_size, args.graph_type, dkt_graph_path=dkt_graph_path,
-                                                                           train_ratio=args.train_ratio, val_ratio=args.val_ratio, shuffle=args.shuffle,
-                                                                           model_type=args.model, use_cuda=args.cuda)
-
-# build models
+                                                                            train_ratio=args.train_ratio, val_ratio=args.val_ratio, shuffle=args.shuffle,
+                                                                            model_type=args.model, use_cuda=args.cuda)# build models
 graph_model = None
 if args.model == 'GKT':
     if args.graph_type == 'MHA':
