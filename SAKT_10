@@ -1,0 +1,482 @@
+import re, math, random
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+# ======================================================
+# Config
+# ======================================================
+CSV_PATH = ""
+
+TOT_Q_SLOTS = 305
+MAX_SEQ_LEN = 300
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.1
+TEST_RATIO = 0.1
+
+D_MODEL = 128
+N_HEADS = 8
+EPOCHS = 5
+BATCH_SIZE = 64
+LR = 1e-3
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using:", DEVICE)
+
+
+# ======================================================
+# Utils
+# ======================================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed()
+
+def accuracy_score(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    return float((y_true == y_pred).mean())
+
+def f1_score_binary(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    tp = ((y_true==1)&(y_pred==1)).sum()
+    fp = ((y_true==0)&(y_pred==1)).sum()
+    fn = ((y_true==1)&(y_pred==0)).sum()
+    if tp == 0:
+        return 0.0
+    prec = tp/(tp+fp+1e-9)
+    rec  = tp/(tp+fn+1e-9)
+    return float(2*prec*rec/(prec+rec+1e-9))
+
+def roc_auc_score_manual(y_true, y_score):
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    pos = y_true==1
+    neg = y_true==0
+    n_pos, n_neg = pos.sum(), neg.sum()
+    if n_pos==0 or n_neg==0: return float("nan")
+    order = np.argsort(y_score)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(len(y_score))+1
+    sum_r_pos = ranks[pos].sum()
+    auc = (sum_r_pos - n_pos*(n_pos+1)/2)/(n_pos*n_neg)
+    return float(auc)
+
+
+# ======================================================
+# STEP 1 — Preprocess CSV → student sequences
+# ======================================================
+def preprocess(csv_path, tot_q_slots=305):
+    df = pd.read_csv(csv_path)
+    qid_cols = [c for c in df.columns if re.match(r"q\d+_id$", c)]
+    slot_nums = sorted(int(re.findall(r"\d+", c)[0]) for c in qid_cols)
+    max_slot = max(slot_nums)
+
+    students = []
+    for _, row in df.iterrows():
+        uid = row["UserId"]
+
+        q_seq, c_seq = [], []
+        for n in range(1, min(tot_q_slots, max_slot)+1):
+            qid_col = f"q{n}_id"
+            if qid_col not in df.columns: continue
+            qid = row[qid_col]
+            if pd.isna(qid): continue
+
+            val = None
+            for cc in [f"q{n}_correct", f"q{n}_answerchoiceselected_iscorrect"]:
+                if cc in df.columns and not pd.isna(row[cc]):
+                    val = row[cc]
+                    break
+            if val is None: continue
+
+            val = int(val)
+            q_seq.append(int(qid))
+            c_seq.append(val)
+
+        if len(q_seq)==0: continue
+        L = len(q_seq)
+        comp_bin = min(int((L/tot_q_slots)*10), 9)
+        students.append({"user_id":uid, "q_seq":q_seq, "c_seq":c_seq, "comp_bin":comp_bin})
+
+    print("Total students:", len(students))
+    return students
+
+
+students = preprocess(CSV_PATH, TOT_Q_SLOTS)
+
+
+# ======================================================
+# Dataset + Loader
+# ======================================================
+class KTSeq(Dataset):
+    def __init__(self, students, max_seq=300):
+        self.samples=[]
+        for s in students:
+            q,c,b = s["q_seq"], s["c_seq"], s["comp_bin"]
+            if len(q)<3: continue
+            for i in range(1,len(q)):
+                st=max(0,i-max_seq)
+                self.samples.append((
+                    torch.tensor(q[st:i],dtype=torch.long),
+                    torch.tensor(c[st:i],dtype=torch.float),
+                    torch.tensor(q[i],dtype=torch.long),
+                    torch.tensor(c[i],dtype=torch.float),
+                    b
+                ))
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self,i): return self.samples[i]
+
+def pad_collate(batch):
+    past_q, past_c, next_q, next_c, bins = zip(*batch)
+    return (
+        pad_sequence(past_q, batch_first=True, padding_value=0),
+        pad_sequence(past_c, batch_first=True, padding_value=0),
+        torch.stack(next_q),
+        torch.stack(next_c),
+        list(bins)
+    )
+
+
+# ======================================================
+# Split
+# ======================================================
+random.shuffle(students)
+N=len(students)
+n_tr=int(TRAIN_RATIO*N)
+n_va=int(VAL_RATIO*N)
+
+train_s=students[:n_tr]
+val_s  =students[n_tr:n_tr+n_va]
+test_s =students[n_tr+n_va:]
+
+train_loader=DataLoader(KTSeq(train_s),BATCH_SIZE,shuffle=True,collate_fn=pad_collate)
+val_loader  =DataLoader(KTSeq(val_s),BATCH_SIZE,shuffle=False,collate_fn=pad_collate)
+test_loader =DataLoader(KTSeq(test_s),BATCH_SIZE,shuffle=False,collate_fn=pad_collate)
+
+print("DataLoaders ready.")
+
+
+# ======================================================
+# MODEL 1 —— SAKT
+# ======================================================
+class SAKT(nn.Module):
+    def __init__(self, n_q, d_model=128, n_heads=8, max_len=300):
+        super().__init__()
+        self.q_emb=nn.Embedding(n_q+1,d_model)
+        self.c_emb=nn.Embedding(2,d_model)
+        self.pos_emb=nn.Embedding(max_len,d_model)
+
+        enc=nn.TransformerEncoderLayer(
+            d_model=d_model,nhead=n_heads,
+            dim_feedforward=4*d_model,
+            dropout=0.1,batch_first=True
+        )
+        self.encoder=nn.TransformerEncoder(enc,1)
+        self.fc=nn.Linear(d_model,1)
+
+    def forward(self,pq,pc,nq):
+        B,T=pq.size()
+        pos=torch.arange(T,device=pq.device).unsqueeze(0).expand(B,T)
+        x=self.q_emb(pq)+self.c_emb(pc.long())+self.pos_emb(pos)
+        h=self.encoder(x)
+        last=h[:,-1,:]
+        nq_emb=self.q_emb(nq)
+        out=self.fc(last+nq_emb).squeeze(-1)
+        return torch.sigmoid(out)
+
+
+# ======================================================
+# MODEL 2 —— AKT
+# ======================================================
+class AKT(nn.Module):
+    def __init__(self,n_questions,d_model=128,n_heads=8,max_len=300,dropout=0.1):
+        super().__init__()
+        self.q_emb=nn.Embedding(n_questions+1,d_model)
+        self.c_emb=nn.Embedding(2,d_model)
+        self.pos_emb=nn.Embedding(max_len,d_model)
+
+        enc=nn.TransformerEncoderLayer(
+            d_model=d_model,nhead=n_heads,
+            dim_feedforward=4*d_model,
+            dropout=dropout,batch_first=True
+        )
+        self.encoder=nn.TransformerEncoder(enc,1)
+
+        self.q_proj=nn.Linear(d_model,d_model)
+        self.k_proj=nn.Linear(d_model,d_model)
+        self.v_proj=nn.Linear(d_model,d_model)
+
+        self.fc1=nn.Linear(2*d_model,d_model)
+        self.fc2=nn.Linear(d_model,1)
+        self.act=nn.ReLU()
+        self.drop=nn.Dropout(dropout)
+
+        self.q_bias=nn.Embedding(n_questions+1,1)
+
+    def forward(self,pq,pc,nq):
+        B,T=pq.size()
+        mask=(pq==0)
+
+        pos=torch.arange(T,device=pq.device).unsqueeze(0).expand(B,T)
+        x=self.q_emb(pq)+self.c_emb(pc.long())+self.pos_emb(pos)
+
+        h=self.encoder(x,src_key_padding_mask=mask)
+
+        nq_emb=self.q_emb(nq)
+        q=self.q_proj(nq_emb).unsqueeze(1)
+        k=self.k_proj(h)
+        v=self.v_proj(h)
+
+        logits=torch.bmm(q,k.transpose(1,2))/math.sqrt(h.size(-1))
+        logits=logits.masked_fill(mask.unsqueeze(1),float("-inf"))
+        att=F.softmax(logits,dim=-1)
+        ctx=torch.bmm(att,v).squeeze(1)
+
+        z=torch.cat([ctx,nq_emb],dim=-1)
+        z=self.drop(self.act(self.fc1(z)))
+        out=self.fc2(z).squeeze(-1)+self.q_bias(nq).squeeze(-1)
+        return torch.sigmoid(out)
+
+
+# ======================================================
+# MODEL 3 —— UKT
+# ======================================================
+class UKT(nn.Module):
+    def __init__(self,n_questions,d_model=128,n_heads=8,max_len=300,dropout=0.1):
+        super().__init__()
+        self.q_emb=nn.Embedding(n_questions+1,d_model)
+        self.c_emb=nn.Embedding(2,d_model)
+        self.concept_emb=nn.Embedding(n_questions+1,d_model)
+        self.pos_emb=nn.Embedding(max_len,d_model)
+
+        enc=nn.TransformerEncoderLayer(
+            d_model=d_model,nhead=n_heads,
+            dim_feedforward=4*d_model,
+            dropout=dropout,batch_first=True
+        )
+        self.encoder=nn.TransformerEncoder(enc,1)
+
+        self.q_proj=nn.Linear(d_model,d_model)
+        self.k_proj=nn.Linear(d_model,d_model)
+        self.v_proj=nn.Linear(d_model,d_model)
+
+        self.fc1=nn.Linear(3*d_model,d_model)
+        self.fc2=nn.Linear(d_model,1)
+        self.act=nn.ReLU()
+        self.drop=nn.Dropout(dropout)
+
+        self.q_bias=nn.Embedding(n_questions+1,1)
+        self.cpt_bias=nn.Embedding(n_questions+1,1)
+
+    def forward(self,pq,pc,nq):
+        B,T=pq.size()
+        mask=(pq==0)
+
+        past_cpt=pq  # no KC map → use question as concept
+        next_cpt=nq
+
+        pos=torch.arange(T,device=pq.device).unsqueeze(0).expand(B,T)
+        x=self.q_emb(pq)+self.c_emb(pc.long())+self.concept_emb(past_cpt)+self.pos_emb(pos)
+
+        h=self.encoder(x,src_key_padding_mask=mask)
+
+        nq_emb=self.q_emb(nq)
+        cpt_emb=self.concept_emb(next_cpt)
+        query=nq_emb+cpt_emb
+
+        q=self.q_proj(query).unsqueeze(1)
+        k=self.k_proj(h)
+        v=self.v_proj(h)
+
+        logits=torch.bmm(q,k.transpose(1,2))/math.sqrt(h.size(-1))
+        logits=logits.masked_fill(mask.unsqueeze(1),float("-inf"))
+        att=F.softmax(logits,dim=-1)
+        ctx=torch.bmm(att,v).squeeze(1)
+
+        z=torch.cat([ctx,nq_emb,cpt_emb],dim=-1)
+        z=self.drop(self.act(self.fc1(z)))
+        out=self.fc2(z).squeeze(-1)
+        out += self.q_bias(nq).squeeze(-1)+self.cpt_bias(next_cpt).squeeze(-1)
+
+        return torch.sigmoid(out)
+
+
+# ======================================================
+# Train / Eval
+# ======================================================
+def run_epoch(loader, model, optimizer=None):
+    training = optimizer is not None
+    model.train() if training else model.eval()
+
+    all_probs=[]
+    all_labels=[]
+    all_bins=[]
+    total=0
+
+    with torch.set_grad_enabled(training):
+        for pq,pc,nq,nc,bins in loader:
+            pq,pc,nq,nc = pq.to(DEVICE), pc.to(DEVICE), nq.to(DEVICE), nc.to(DEVICE)
+            probs=model(pq,pc,nq)
+            loss=F.binary_cross_entropy(probs,nc)
+
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total+=loss.item()
+            all_probs.append(probs.detach().cpu().numpy())
+            all_labels.append(nc.cpu().numpy())
+            all_bins.extend(bins)
+
+    if len(all_probs)==0:
+        return float("nan"),np.array([]),np.array([]),np.array([])
+
+    return total/len(loader), np.concatenate(all_probs), np.concatenate(all_labels), np.array(all_bins)
+
+
+def compute_fairness(probs,labels,bins,name):
+    print(f"\n[{name} Fairness]")
+    df=pd.DataFrame({"prob":probs,"label":labels,"bin":bins})
+    df["pred"]=(df.prob>=0.5).astype(int)
+
+    for g,sub in df.groupby("bin"):
+        tp=((sub.pred==1)&(sub.label==1)).sum()
+        fp=((sub.pred==1)&(sub.label==0)).sum()
+        tn=((sub.pred==0)&(sub.label==0)).sum()
+        fn=((sub.pred==0)&(sub.label==1)).sum()
+        tpr=tp/(tp+fn+1e-9)
+        fpr=fp/(fp+tn+1e-9)
+        acc=(tp+tn)/len(sub)
+        print(f" Bin {g}: size={len(sub)}  TPR={tpr:.3f}, FPR={fpr:.3f}, ACC={acc:.3f}")
+
+
+
+# ======================================================
+# Random eval（stratified pos/neg）+ threshold sweep
+# ======================================================
+def random_eval(model, students, pos_n=5, neg_n=5):
+    model.eval()
+    probs,labels,bins=[],[],[]
+
+    with torch.no_grad():
+        for stu in students:
+            q,c,b = stu["q_seq"], stu["c_seq"], stu["comp_bin"]
+            L=len(q)
+            if L<3: continue
+
+            pos_idx=[i for i in range(1,L) if c[i]==1]
+            neg_idx=[i for i in range(1,L) if c[i]==0]
+
+            pick=[]
+            if len(pos_idx)>0: pick+=random.sample(pos_idx,min(pos_n,len(pos_idx)))
+            if len(neg_idx)>0: pick+=random.sample(neg_idx,min(neg_n,len(neg_idx)))
+            if len(pick)==0: continue
+
+            for k in pick:
+                pq=torch.tensor(q[:k]).unsqueeze(0).to(DEVICE)
+                pc=torch.tensor(c[:k]).unsqueeze(0).to(DEVICE)
+                nq=torch.tensor([q[k]]).to(DEVICE)
+                y=c[k]
+
+                prob=model(pq,pc,nq).item()
+                probs.append(prob)
+                labels.append(y)
+                bins.append(b)
+
+    probs=np.array(probs)
+    labels=np.array(labels)
+    bins=np.array(bins)
+
+    pred=(probs>=0.5).astype(int)
+    acc=accuracy_score(labels,pred)
+    auc=roc_auc_score_manual(labels,probs)
+    f1=f1_score_binary(labels,pred)
+
+    print("\n===== RANDOM EVAL =====")
+    print(f"AUC={auc:.4f}, ACC={acc:.4f}, F1={f1:.4f}, N={len(labels)}")
+
+    # best threshold (no sklearn)
+    best_f1=0
+    best_t=0.5
+    for t in np.linspace(0.05,0.95,181):
+        p=(probs>=t).astype(int)
+        f=f1_score_binary(labels,p)
+        if f>best_f1:
+            best_f1=f; best_t=t
+    print(f"Best threshold: t={best_t:.3f}, F1={best_f1:.4f}")
+
+    compute_fairness(probs,labels,bins,"Random")
+    return auc,acc,f1,best_f1,best_t
+
+
+# ======================================================
+# Unified runner
+# ======================================================
+def run_model(model_name, n_questions):
+    print(f"\n================ Running {model_name} ================")
+
+    if model_name=="SAKT":
+        model=SAKT(n_questions, D_MODEL, N_HEADS, MAX_SEQ_LEN).to(DEVICE)
+    elif model_name=="AKT":
+        model=AKT(n_questions, D_MODEL, N_HEADS, MAX_SEQ_LEN).to(DEVICE)
+    elif model_name=="UKT":
+        model=UKT(n_questions, D_MODEL, N_HEADS, MAX_SEQ_LEN).to(DEVICE)
+    else:
+        raise ValueError("Unknown model")
+
+    optimizer=torch.optim.Adam(model.parameters(),lr=LR)
+
+    # training
+    for ep in range(1,EPOCHS+1):
+        tr_loss, tr_p, tr_y, _ = run_epoch(train_loader,model,optimizer)
+        va_loss, va_p, va_y, va_b = run_epoch(val_loader,model)
+
+        pred=(va_p>=0.5).astype(int)
+        acc=accuracy_score(va_y,pred)
+        auc=roc_auc_score_manual(va_y,va_p)
+        f1 =f1_score_binary(va_y,pred)
+        print(f"Epoch {ep}: Val AUC={auc:.4f} Acc={acc:.4f} F1={f1:.4f}")
+
+    # test
+    te_loss, te_p, te_y, te_b = run_epoch(test_loader,model)
+    print("\n--- Normal test evaluation ---")
+    pred=(te_p>=0.5).astype(int)
+    acc=accuracy_score(te_y,pred)
+    auc=roc_auc_score_manual(te_y,te_p)
+    f1 =f1_score_binary(te_y,pred)
+    print("Test ACC=",acc,"AUC=",auc,"F1=",f1)
+    compute_fairness(te_p,te_y,te_b,"Test")
+
+    # random
+    print("\n--- Random evaluation (each student stratified) ---")
+    random_eval(model,test_s)
+
+
+# ======================================================
+# Run all three models
+# ======================================================
+# First compute n_questions
+all_q=[]
+for s in students:
+    all_q+=s["q_seq"]
+n_questions=max(all_q)
+
+# Example: run one model
+# run_model("SAKT", n_questions)
+
+# Or run all:
+run_model("SAKT", n_questions)
+run_model("AKT", n_questions)
+run_model("UKT", n_questions)
