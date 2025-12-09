@@ -85,7 +85,7 @@ if __name__ == "__main__":
     epochs = args.epochs
     batch_size = args.batch_size
     min_seq = 3
-    max_seq = 200
+    max_seq = 310
     grad_clip = 15.0
     patience = 15  # early-stopping patience
 
