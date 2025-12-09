@@ -267,12 +267,13 @@ def _update_fairness_bins(bin_labels, bin_outputs, bin_students, answers, pred_r
 
 
 def _compute_bin_stats(bin_labels, bin_outputs, bin_students):
-    """Compute TPR/FPR/ACC/F1 per non-empty completion bin, with counts.
+    """Compute TPR/FPR/ACC/F1/AUC per non-empty completion bin, with counts.
 
     Returns stats per bin including:
       - students: number of unique students in bin
       - predictions: number of prediction events (valid positions)
       - f1: F1 score for the bin
+      - auc: AUC for the bin
     """
     stats = {}
     for b in range(10):
@@ -296,12 +297,22 @@ def _compute_bin_stats(bin_labels, bin_outputs, bin_students):
         precision = float(tp) / float(tp + fp) if (tp + fp) > 0 else 0.0
         recall = tpr  # recall = TPR
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        # AUC for this bin
+        if np.unique(y_true).size == 2:
+            try:
+                auc = roc_auc_score(y_true, y_score)
+            except:
+                auc = np.nan
+        else:
+            auc = np.nan
 
         stats[b] = {
             "tpr": tpr,
             "fpr": fpr,
             "acc": acc,
             "f1": f1,
+            "auc": float(auc),
             "predictions": int(y_true.size),
             "students": int(len(bin_students[b]) if bin_students[b] is not None else 0),
         }
@@ -309,9 +320,9 @@ def _compute_bin_stats(bin_labels, bin_outputs, bin_students):
 
 
 def _compute_fairness_from_bins(bin_stats):
-    """Compute Euclidean EO distance (lowest vs highest bin) and ACC variance."""
+    """Compute Euclidean EO distance and difference between lowest vs highest bin for ACC/F1/AUC."""
     if not bin_stats:
-        return {"eo_dist": np.nan, "acc_var": np.nan, "non_empty_bins": []}
+        return {"eo_dist": np.nan, "acc_var": np.nan, "f1_var": np.nan, "auc_var": np.nan, "non_empty_bins": []}
 
     non_empty = sorted(bin_stats.keys())
     low = non_empty[0]
@@ -323,14 +334,20 @@ def _compute_fairness_from_bins(bin_stats):
     fpr_high = bin_stats[high]["fpr"]
 
     eo_dist = float(np.sqrt((tpr_low - tpr_high) ** 2 + (fpr_low - fpr_high) ** 2))
-    accs = [bin_stats[b]["acc"] for b in non_empty]
-    acc_var = float(np.var(accs)) if accs else np.nan
+    
+    # Difference between lowest and highest bin (not statistical variance)
+    acc_var = abs(bin_stats[low]["acc"] - bin_stats[high]["acc"])
+    f1_var = abs(bin_stats[low]["f1"] - bin_stats[high]["f1"])
+    
+    auc_low = bin_stats[low]["auc"]
+    auc_high = bin_stats[high]["auc"]
+    auc_var = abs(auc_low - auc_high) if not (np.isnan(auc_low) or np.isnan(auc_high)) else np.nan
 
-    return {"eo_dist": eo_dist, "acc_var": acc_var, "non_empty_bins": non_empty}
+    return {"eo_dist": eo_dist, "acc_var": acc_var, "f1_var": f1_var, "auc_var": auc_var, "non_empty_bins": non_empty}
 
 
 def _print_fairness_summary(bin_stats, fairness, prefix, log_handle=None):
-    """Print fairness metrics with student/prediction counts and F1."""
+    """Print fairness metrics with student/prediction counts, F1, and AUC."""
     lines = []
     lines.append("  Fairness per completion-rate bin:")
 
@@ -342,14 +359,14 @@ def _print_fairness_summary(bin_stats, fairness, prefix, log_handle=None):
         high = (b + 1) * 10
         lines.append(
             f"    Bin {b} ({low:2d}-{high:3d}%): students={s['students']}, predictions={s['predictions']}, "
-            f"TPR={s['tpr']:.3f}, FPR={s['fpr']:.3f}, ACC={s['acc']:.3f}, F1={s['f1']:.3f}"
+            f"TPR={s['tpr']:.3f}, FPR={s['fpr']:.3f}, ACC={s['acc']:.3f}, F1={s['f1']:.3f}, AUC={s['auc']:.3f}"
         )
 
     lines.append(
         f"  Equalized odds distance (lowest vs highest non-empty bin): {fairness['eo_dist']:.4f}"
     )
     lines.append(
-        f"  Accuracy variance across bins: {fairness['acc_var']:.6f}"
+        f"  Difference (lowest vs highest bin) - ACC: {fairness['acc_var']:.6f}, F1: {fairness['f1_var']:.6f}, AUC: {fairness['auc_var']:.6f}"
     )
 
     for line in lines:

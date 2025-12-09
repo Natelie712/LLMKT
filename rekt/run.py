@@ -54,7 +54,7 @@ def _compute_bin_stats(bin_labels, bin_outputs):
 
 
 def _compute_fairness_from_bins(bin_stats):
-    """Compute Euclidean equalized odds distance and accuracy variance.
+    """Compute Euclidean equalized odds distance and difference between lowest vs highest bin for ACC/F1/AUC.
 
     Parameters
     ----------
@@ -67,10 +67,12 @@ def _compute_fairness_from_bins(bin_stats):
         {
           "eo_dist_low_high": float or nan,
           "acc_var": float or nan,
+          "f1_var": float or nan,
+          "auc_var": float or nan,
         }
     """
     if not bin_stats:
-        return {"eo_dist_low_high": float("nan"), "acc_var": float("nan")}
+        return {"eo_dist_low_high": float("nan"), "acc_var": float("nan"), "f1_var": float("nan"), "auc_var": float("nan")}
 
     # sort non-empty bins
     non_empty_bins = sorted(bin_stats.keys())
@@ -94,15 +96,12 @@ def _compute_fairness_from_bins(bin_stats):
         # Euclidean distance in (TPR, FPR) space
         eo_dist = math.sqrt((tpr_low - tpr_high) ** 2 + (fpr_low - fpr_high) ** 2)
 
-    # Accuracy variance across all non-empty bins
-    accs = [
-        st["acc"]
-        for st in bin_stats.values()
-        if not np.isnan(st["acc"])
-    ]
-    acc_var = np.var(accs) if accs else float("nan")
+    # Difference between lowest and highest bin (not statistical variance)
+    acc_var = abs(low_stat["acc"] - high_stat["acc"]) if not (np.isnan(low_stat["acc"]) or np.isnan(high_stat["acc"])) else float("nan")
+    f1_var = abs(low_stat.get("f1", float("nan")) - high_stat.get("f1", float("nan"))) if not (np.isnan(low_stat.get("f1", float("nan"))) or np.isnan(high_stat.get("f1", float("nan")))) else float("nan")
+    auc_var = abs(low_stat.get("auc", float("nan")) - high_stat.get("auc", float("nan"))) if not (np.isnan(low_stat.get("auc", float("nan"))) or np.isnan(high_stat.get("auc", float("nan")))) else float("nan")
 
-    return {"eo_dist_low_high": eo_dist, "acc_var": acc_var}
+    return {"eo_dist_low_high": eo_dist, "acc_var": acc_var, "f1_var": f1_var, "auc_var": auc_var}
 
 
 def run_epoch(
@@ -291,10 +290,26 @@ def run_epoch(
             denom = tp + tn + fp + fn
             acc = float(tp + tn) / denom if denom > 0 else float("nan")
             
+            # F1 score for this bin
+            precision = float(tp) / (tp + fp) if (tp + fp) > 0 else float("nan")
+            recall = tpr  # recall = TPR
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 and not (np.isnan(precision) or np.isnan(recall)) else float("nan")
+            
+            # AUC for this bin
+            if np.unique(y_true).size == 2:
+                try:
+                    auc_bin = metrics.roc_auc_score(y_true, y_score)
+                except:
+                    auc_bin = float("nan")
+            else:
+                auc_bin = float("nan")
+            
             computed_bin_stats[b] = {
                 "tpr": tpr,
                 "fpr": fpr,
                 "acc": acc,
+                "f1": f1,
+                "auc": auc_bin,
                 "students": num_students,
                 "predictions": y_true.size
             }
@@ -311,11 +326,13 @@ def run_epoch(
                 f"predictions={st['predictions']}, "
                 f"TPR={st['tpr']:.3f}, "
                 f"FPR={st['fpr']:.3f}, "
-                f"ACC={st['acc']:.3f}"
+                f"ACC={st['acc']:.3f}, "
+                f"F1={st['f1']:.3f}, "
+                f"AUC={st['auc']:.3f}"
             )
         print(
-            f"Equalized odds distance: {fairness['eo_dist_low_high']:.4f}"
+            f"Equalized odds distance (lowest vs highest non-empty bin): {fairness['eo_dist_low_high']:.4f}"
         )
-        print(f"Accuracy variance across bins: {fairness['acc_var']:.6f}")
+        print(f"Difference (lowest vs highest bin) - ACC: {fairness['acc_var']:.6f}, F1: {fairness['f1_var']:.6f}, AUC: {fairness['auc_var']:.6f}")
 
     return avg_loss, acc, auc, f1
