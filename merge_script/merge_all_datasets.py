@@ -36,6 +36,7 @@ def build_assessment_events(assessments: pd.DataFrame) -> pd.DataFrame:
     - Groups by (UserId, QuesitonId, AttemptId) to handle multi-select questions
     - For each question attempt, aggregates correctness across all selected choices
     - Question is marked correct only if ALL selected choices are correct
+    - Preserves question text for LBKT compatibility
     
     This ensures:
     - Multi-select questions count as ONE question attempt
@@ -111,6 +112,7 @@ def build_assessment_events(assessments: pd.DataFrame) -> pd.DataFrame:
         "QuizTimeCompleted", "TimeCompleted", "TimeStarted",
         "AttemptId", "AttemptNumber", "QuizId", "QuestionNumber", "QuesitonId"
     ]
+    
     for col in preserve_cols:
         if col in df_selected.columns and col not in group_cols:
             agg_dict[col] = "first"
@@ -158,7 +160,7 @@ def pivot_question_history(events: pd.DataFrame) -> pd.DataFrame:
     This preserves:
     - the per-student sequence structure
     - as many assessment-level columns as possible
-    - compatibility with existing preprocess_dataset.py (expects q*_id, q*_correct).
+    - compatibility with existing preprocess_dataset.py (expects q*_id, q*_correct)
     """
     if events.empty:
         return pd.DataFrame(columns=["UserId"])
