@@ -7,7 +7,8 @@ Full LBKT model combining:
 - LSTM Layer (for sequential knowledge tracking)
 
 Key components:
-- Rasch Embedding: E_rasch = E_token + E_diff * (E_token + E_segment)
+- Rasch Embedding: E_rasch = E_diff + E_diff * E_question
+- Final Embedding: E_total = E_rasch + E_token + E_position
 - BERT Encoder: Multi-head attention + Feed-forward
 - LSTM: Sequential state tracking for long sequences (>400 interactions)
 """
@@ -158,7 +159,7 @@ class PositionalEmbedding(nn.Module):
     Sinusoidal positional embeddings as described in "Attention is All You Need".
     """
 
-    def __init__(self, d_model, max_len=512):
+    def __init__(self, d_model, max_len=2048):  # Increased default safety limit
         super().__init__()
 
         # Compute positional encodings once in log space
@@ -175,32 +176,26 @@ class PositionalEmbedding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
+        # Dynamically grabs positions up to the input length x.size(1)
+        # This prevents length mismatch errors if input > default max_len
         return self.pe[:, : x.size(1)]
-
-
-class SegmentEmbedding(nn.Embedding):
-    """Segment embedding for question/skill differentiation."""
-
-    def __init__(self, vocab_size, embed_size=128):
-        super().__init__(vocab_size, embed_size, padding_idx=0)
 
 
 class RaschBERTEmbedding(nn.Module):
     """
     LBKT Embedding with Rasch model difficulty calculation.
 
-    Implements: E_rasch = E_token + E_diff * (E_token + E_segment)
+    Implements: E = E_rasch + E_token + E_position
+    Where:      E_rasch = E_diff + E_diff * E_question
 
     The Rasch model explicitly models item difficulty:
-    - E_token: Question/interaction embedding
-    - E_segment: Response/skill embedding  
-    - E_diff: Learned difficulty parameter per question
+    - E_token: Interaction embedding (Question + Answer)
+    - E_question: Question embedding (Question ID)
+    - E_diff: Difficulty embedding (Question ID)
     - E_position: Sinusoidal positional encoding
-
-    Final embedding = Rasch embedding + Positional embedding
     """
 
-    def __init__(self, vocab_size, embed_size, max_seq_len=100, dropout=0.1):
+    def __init__(self, vocab_size, embed_size, max_seq_len=1024, dropout=0.1):
         """
         Args:
             vocab_size: Number of unique questions/skills (n_skill)
@@ -210,42 +205,42 @@ class RaschBERTEmbedding(nn.Module):
         """
         super().__init__()
         
-        # Token embedding: handles both question IDs and question+correct pairs
-        # vocab_size * 2 + 1 to handle: q_id for wrong, q_id + n_skill for correct
+        # Token embedding: encoded as q_id + correct * n_skill
         self.token = TokenEmbedding(vocab_size=2 * vocab_size + 1, embed_size=embed_size)
         
-        # Positional embedding (max_len - 1 because we use shifted sequences)
+        # Question embedding: encoded as q_id
+        self.question = nn.Embedding(vocab_size + 1, embed_size, padding_idx=0)
+        
+        # Difficulty embedding: encoded as q_id
+        self.difficulty = nn.Embedding(vocab_size + 1, embed_size, padding_idx=0)
+        
+        # Positional embedding
         self.position = PositionalEmbedding(d_model=embed_size, max_len=max_seq_len)
         
-        # Segment embedding (for question IDs - acts as difficulty in Rasch formulation)
-        self.segment = SegmentEmbedding(vocab_size=vocab_size + 1, embed_size=embed_size)
-        
         self.dropout = nn.Dropout(p=dropout)
-        self.embed_size = embed_size
 
-    def forward(self, sequence, segment_label):
+    def forward(self, sequence, q_ids):
         """
         Args:
-            sequence: Token IDs (batch_size, seq_len) - encoded as q_id + correct * n_skill
-            segment_label: Question IDs for segment embedding (batch_size, seq_len)
+            sequence: Interaction IDs (batch_size, seq_len) - encoded as q_id + correct * n_skill
+            q_ids: Question IDs (batch_size, seq_len) - used for Rasch difficulty
 
         Returns:
-            Embedded sequence with Rasch-style embedding
+            Combined embedding
         """
-        # Token and segment embeddings
+        # 1. Base Embeddings
         token_emb = self.token(sequence)
-        segment_emb = self.segment(segment_label)
+        question_emb = self.question(q_ids)
+        diff_emb = self.difficulty(q_ids)
         
-        # Rasch-style embedding from BERT-Rasch notebook:
-        # x = token + segment * (token + segment)
-        # This uses segment embedding as a multiplicative modifier (like difficulty)
-        rasch_emb = token_emb + segment_emb * (token_emb + segment_emb)
+        # 2. Rasch Formula: E_rasch = E_diff + E_diff * E_question
+        rasch_emb = diff_emb + diff_emb * question_emb
         
-        # Add positional embedding
+        # 3. Positional Embedding
         pos_emb = self.position(sequence)
         
-        # Final embedding
-        x = rasch_emb + pos_emb
+        # 4. Final Combination
+        x = rasch_emb + token_emb + pos_emb
         
         return self.dropout(x)
 
@@ -270,20 +265,9 @@ class LBKT(nn.Module):
         num_layers=2,
         lstm_hidden=128,
         lstm_layers=1,
-        max_seq_len=100,
+        max_seq_len=1024,
         dropout=0.1,
     ):
-        """
-        Args:
-            num_questions: Number of unique questions/skills
-            embed_dim: Hidden dimension (must be divisible by num_heads)
-            num_heads: Number of attention heads
-            num_layers: Number of Transformer blocks
-            lstm_hidden: LSTM hidden size
-            lstm_layers: Number of LSTM layers
-            max_seq_len: Maximum sequence length
-            dropout: Dropout rate
-        """
         super().__init__()
 
         self.model_name = "lbkt"
@@ -307,7 +291,7 @@ class LBKT(nn.Module):
         # Transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [
-                TransformerBlock(embed_dim, num_heads, embed_dim * 4, dropout)
+                TransformerBlock(embed_dim, num_heads, self.feed_forward_hidden, dropout)
                 for _ in range(num_layers)
             ]
         )
@@ -327,10 +311,8 @@ class LBKT(nn.Module):
     def forward(self, x, segment_info):
         """
         Args:
-            x: Input sequence (batch_size, seq_len)
-               Encoded as: q_id + correct * n_skill
-            segment_info: Question IDs (batch_size, seq_len)
-               Used for difficulty embedding and masking
+            x: Input sequence (batch_size, seq_len) -> Interaction IDs
+            segment_info: Question IDs (batch_size, seq_len) -> Question IDs
 
         Returns:
             Predictions (batch_size, seq_len) - sigmoid logits
@@ -366,18 +348,9 @@ class LBKTSimple(nn.Module):
         embed_dim,
         lstm_hidden=None,
         lstm_layers=1,
-        max_seq_len=512,
+        max_seq_len=1024,
         dropout=0.1,
     ):
-        """
-        Args:
-            num_questions: Number of unique questions/concepts
-            embed_dim: Embedding dimension
-            lstm_hidden: LSTM hidden size (defaults to embed_dim)
-            lstm_layers: Number of LSTM layers
-            max_seq_len: Maximum sequence length
-            dropout: Dropout rate
-        """
         super().__init__()
 
         self.model_name = "lbkt_simple"
@@ -388,10 +361,10 @@ class LBKTSimple(nn.Module):
         # Interaction embedding (question + response)
         self.interaction_emb = nn.Embedding(num_questions * 2 + 1, embed_dim, padding_idx=0)
         
-        # Question embedding for difficulty
+        # Question embedding (E_q)
         self.question_emb = nn.Embedding(num_questions + 1, embed_dim, padding_idx=0)
         
-        # Difficulty embedding (Rasch component)
+        # Difficulty embedding (E_diff)
         self.difficulty_emb = nn.Embedding(num_questions + 1, embed_dim, padding_idx=0)
         
         # Positional embedding
@@ -423,17 +396,19 @@ class LBKTSimple(nn.Module):
         # Interaction encoding: q_id for wrong, q_id + num_questions for correct
         x = q + self.num_questions * r
         
-        # Embeddings
-        interaction_emb = self.interaction_emb(x)
-        question_emb = self.question_emb(q)
-        diff_emb = self.difficulty_emb(q)
+        # 1. Fetch Embeddings
+        interaction_emb = self.interaction_emb(x) # E_token
+        question_emb = self.question_emb(q)       # E_q
+        diff_emb = self.difficulty_emb(q)         # E_diff
+        
+        # 2. Rasch Embedding Formula: E_rasch = E_diff + E_diff * E_question
+        rasch_emb = diff_emb + diff_emb * question_emb
+        
+        # 3. Positional Embedding
         pos_emb = self.position_emb(x)
         
-        # Rasch embedding: E_rasch = E_interaction + E_diff * (E_interaction + E_question)
-        rasch_emb = interaction_emb + diff_emb * (interaction_emb + question_emb)
-        
-        # Add positional encoding
-        emb = rasch_emb + pos_emb
+        # 4. Combine: Total = Rasch + Interaction + Position
+        emb = rasch_emb + interaction_emb + pos_emb
         
         # LSTM
         h, _ = self.lstm(emb)
